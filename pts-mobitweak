@@ -5305,7 +5305,7 @@ use vars qw ($opt_outfile $opt_title $opt_updatedtitle
 	     $opt_prefixtitle $opt_author $opt_addauthor 
              $opt_publisher $opt_description $opt_language $opt_subject
 	     $opt_databasename $opt_fiximagesizes $opt_origmtime
-	     $opt_gen3imagefix $opt_keepifsame
+	     $opt_gen3imagefix $opt_keepifsame $opt_fromopf
 	     $opt_addthumbnail $opt_coverimage $opt_patch $opt_coveroffset
 	     $opt_exthtype $opt_addexthtype $opt_exthdata $opt_booktype
 	     $opt_delexthtype $opt_delexthindex $opt_mbpfile $opt_savecover $opt_savethumb
@@ -5316,7 +5316,7 @@ Getopt::Mixed::getOptions ("outfile=s title=s updatedtitle=s
                             prefixtitle=s author=s addauthor=s
                             description=s language=s subject=s
                             publisher=s databasename=s patch fiximagesizes origmtime
-                            gen3imagefix keepifsame
+                            gen3imagefix keepifsame fromopf=s
                             exthtype=s addexthtype=s exthdata=s delexthtype=s 
                             delexthindex=s booktype=s
                             addthumbnail=s coverimage=s coveroffset=s
@@ -5333,6 +5333,7 @@ if (not defined $opt_outfile) {
 	defined $opt_publisher or defined $opt_databasename or
 	defined $opt_patch or defined $opt_fiximagesizes or
 	defined $opt_origmtime or defined $opt_keepifsame or
+	defined $opt_fromopf or
 	defined $opt_gen3imagefix or defined $opt_exthtype or
 	defined $opt_addexthtype or defined $opt_exthdata or
 	defined $opt_delexthtype or defined $opt_delexthindex or
@@ -5354,6 +5355,10 @@ my $updatedtitle = "";
 
 my $delexthindex = 0;
 $delexthindex = $opt_delexthindex if defined $opt_delexthindex;
+
+my $filename = shift;
+die "ERROR: Too many command-line arguments.\n" if @ARGV;
+
 
 #
 # Read info from mbp file
@@ -5383,6 +5388,57 @@ if (defined $opt_mbpfile) {
     print "Publiser: $publisher\n";
 }
 
+my %HENT=qw(lt < gt > amp & quot " apos '); # "
+sub htmldecode_utf8($) {
+  my $S=$_[0];
+  # TODO(pts): Die if unknown entity (not in %HENT) encountered.
+  $S=~s@&(lt|gt|amp|quot|apos);|&#[xX]([0-9a-fA-F]+);|&#(\d+);@
+    defined $1 ? defined $HENT{$1} ? $HENT{$1} : die("unknown entity: &$1;\n") : defined $2 ? pack('U', hex($2)) : pack('U', $3) @ge;
+  $S
+}
+
+if (defined $opt_fromopf) {
+  my $F;
+  die "ERROR: cannot open medatada.opf file: $opt_fromopf: $!\n" unless
+      open $F, '<', $opt_fromopf;
+  my $data = join('', <$F>);
+  die unless close $F;
+  die "ERROR: metadata.opf not an XML: $opt_fromopf\n" unless $data =~ m@<?xml\s@;
+  die "ERROR: metadata.opf not an UTF-8 XML: $opt_fromopf\n" unless $data =~ m@<?xml\s+[^>].*?\bencoding=["'](?i)utf-8['"]@s;
+
+  my $opf_coverimage;
+  while ($data =~ m@<reference href="([^"<>]*)" type="cover"@g) {
+    die "ERROR: metadata.opf has duplicate cover image: $opt_fromopf\n" if defined $opf_coverimage;
+    $opf_coverimage = $1;
+  }
+  $opf_coverimage = htmldecode_utf8($opf_coverimage);
+  $opf_coverimage = substr($filename, 0, rindex($filename, '/') + 1) . $opf_coverimage if
+      $opf_coverimage !~ m@\A/@ and index($filename, '/') >= 0;
+
+  my $opf_author;
+  while ($data =~ m@<dc:creator(?=\s)[^<>]*?\s+opf:role="aut">([^<]*)<@g) {
+    my $an_author = htmldecode_utf8($1);
+    $an_author = '?' if !length($an_author);
+    if (defined $opf_author) {
+      $opf_author .= " & " . $an_author;  # TODO(pts): Add smarter.
+    } else {
+      $opf_author = $an_author;
+    }
+  }
+  die "ERROR: metadata.opf does not contain an author: $opt_fromopf\n" if !defined $opf_author;
+
+  my $opf_title;
+  while ($data =~ m@<dc:title>([^<]*)<@g) {
+    die "ERROR: metadata.opf has duplicate title: $opt_fromopf\n" if defined $opf_title;
+    $opf_title = htmldecode_utf8($1);
+  }
+  die "ERROR: metadata.opf does not contain a title: $opt_fromopf\n" if !defined $opf_title;
+
+  $opt_coverimage = $opf_coverimage if defined $opf_coverimage;
+  $opt_author = $opf_author if defined $opf_author;
+  $opt_title = $opf_title if defined $opf_title;
+}
+
 $author = $opt_author if defined $opt_author;
 $addauthor = $opt_addauthor if defined $opt_addauthor;
 $title = $opt_title if defined $opt_title;
@@ -5395,9 +5451,6 @@ $subject = $opt_subject if defined $opt_subject;
 #
 # Read mobi file
 #
-
-my $filename = shift;
-
 
 if (not $filename) {
     print "Usage: mobi2mobi [options] filename\n";
@@ -6162,6 +6215,10 @@ to the output file.
 =item B<--keepifsame>
 
 Keep the original file if the author, title and the cover image are the same.
+
+=item B<--fromopf>
+
+Read some metadata fields from the specified metadata.opf file.
 
 =item B<--gen3imagefix>
 
