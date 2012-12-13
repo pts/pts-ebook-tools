@@ -5282,7 +5282,6 @@ package main;
 
 use Palm::PDB;
 use Palm::Doc;
-use Date::Format;  # for ctime call
 use Getopt::Mixed;
 #use Image::Size qw(imgsize);   # Used to recognize the first record that is an image
 
@@ -5451,9 +5450,9 @@ my $seed = $pdb->{"uniqueIDseed"};
 my $ctime = $pdb->{"ctime"};
 my $mtime = $pdb->{"mtime"};
 my $btime = $pdb->{"baktime"};
-my $sctime = ctime ($ctime);
-my $smtime = ctime ($mtime);
-my $sbtime = ctime ($btime);
+my $sctime = gmtime ($ctime) . " GMT\n";
+my $smtime = gmtime ($mtime) . " GMT\n";
+my $sbtime = gmtime ($btime) . " GMT\n";
 
 print "Database Name: $name\n";
 print "      Version: $version\n";
