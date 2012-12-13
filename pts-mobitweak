@@ -1,0 +1,6534 @@
+#!/usr/bin/env perl
+#
+# pts-mobitweak: minified .mobi file tweaker
+# by pts@fazekas.hu at Thu Dec 13 20:46:07 CET 2012
+#
+# Example usage:
+#
+#   $ pts-mobitweak --origmtime --coverimage=my.png --author="My Author" --title="My Title" --output=out.mobi in.mobi
+#
+# The input and output files can be the same.
+#
+# The transformation is deterministic but and usually idempotent (i.e. doing
+# it many times is the same as doing it once).
+#
+# If there is no change needed in the file, the output file may still be
+# different from the input. TODO(pts): Fix it.
+#
+# Based on the mobi2mobi tool in mobiperl-0.0.43:
+#
+#    Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    mobi2mobi, Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+package Palm::PDB; BEGIN { $INC{"Palm/PDB.pm"} = "Palm/PDB.pm" }
+BEGIN {
+# PDB.pm
+#
+# Perl module for reading and writing Palm databases (both PDB and PRC).
+#
+#	Copyright (C) 1999, 2000, Andrew Arensburger.
+#	You may distribute this file under the terms of the Artistic
+#	License, as specified in the README file.
+
+# A Palm database file (either .pdb or .prc) has the following overall
+# structure:
+#	Header
+#	Index header
+#	Record/resource index
+#	Two NUL(?) bytes
+#	Optional AppInfo block
+#	Optional sort block
+#	Records/resources
+# See http://www.palmos.com/dev/tech/docs/fileformats.zip
+# for details.
+
+use strict;
+package Palm::PDB;
+use vars qw( $VERSION %PDBHandlers %PRCHandlers );
+
+# One liner, to allow MakeMaker to work.
+$VERSION = '1.012';
+
+=head1 NAME
+
+Palm::PDB - Parse Palm database files.
+
+=head1 SYNOPSIS
+
+    use Palm::PDB;
+    use SomeHelperClass;
+
+    $pdb = new Palm::PDB;
+    $pdb->Load("myfile.pdb");
+
+    # Manipulate records in $pdb
+
+    $pdb->Write("myotherfile.pdb");
+
+(Note: yes, you do want to use C<Palm::PDB>, even if you're dealing
+with some other type of database. $pdb will be reblessed to the
+appropriate type by C<$pdb-E<gt>Load>.)
+
+=head1 DESCRIPTION
+
+The Palm::PDB module provides a framework for reading and writing
+database files for use on PalmOS devices such as the PalmPilot. It can
+read and write both Palm Database (C<.pdb>) and Palm Resource
+(C<.prc>) files.
+
+By itself, the PDB module is not terribly useful; it is intended to be
+used in conjunction with supplemental modules for specific types of
+databases, such as Palm::Raw or Palm::Memo.
+
+The Palm::PDB module encapsulates the common work of parsing the
+structure of a Palm database. The L<Load()|/Load> function reads the file,
+then passes the individual chunks (header, records, etc.) to
+application-specific functions for processing. Similarly, the
+L<Write()|/Write> function calls application-specific functions to get the
+individual chunks, then writes them to a file.
+
+=head1 METHODS
+
+=cut
+
+use constant dmRecordIDReservedRange => 1;
+					# The range of upper bits in the database's
+					# uniqueIDSeed from 0 to this number are
+					# reserved and not randomly picked when a
+					#database is created.
+
+my $EPOCH_1904 = 2082844800;		# Difference between Palm's
+					# epoch (Jan. 1, 1904) and
+					# Unix's epoch (Jan. 1, 1970),
+					# in seconds.
+my $HeaderLen = 32+2+2+(9*4);		# Size of database header
+my $RecIndexHeaderLen = 6;		# Size of record index header
+my $IndexRecLen = 8;			# Length of record index entry
+my $IndexRsrcLen = 10;			# Length of resource index entry
+
+# XXX Should we 'use constant' for the above vars?
+
+
+%PDBHandlers = ();			# Record handler map
+%PRCHandlers = ();			# Resource handler map
+
+=head2 new
+
+  $new = new Palm::PDB();
+
+Creates a new PDB. $new is a reference to an anonymous hash. Some of
+its elements have special significance. See L<Load()|/Load>.
+
+=cut
+
+sub new
+{
+	my $class	= shift;
+	my $params	= shift;
+
+	my $self = {};
+
+
+	# Initialize the PDB. These values are just defaults, of course.
+	$self->{'name'} 	= $params->{'name'}		|| "";
+	$self->{'attributes'}	= $params->{'attributes'} 	|| {};
+	$self->{'version'}	= $params->{'version'} 		|| 0;
+
+	my $now = time;
+
+	$self->{'ctime'} 	= $params->{'ctime'}		|| $now;
+	$self->{'mtime'} 	= $params->{'mtime'}		|| $now;
+	$self->{'baktime'} 	= $params->{'baktime'}		|| -$EPOCH_1904;
+
+	$self->{'modnum'}	= $params->{'modnum'}		|| 0;
+	$self->{'type'}		= $params->{'type'}		|| "\0\0\0\0";
+	$self->{'creator'} 	= $params->{'creator'}		|| "\0\0\0\0";
+	$self->{'uniqueIDseed'} = $params->{'uniqueIDseed'}	|| 0;
+
+	$self->{"2NULs"}	= "\0\0";
+
+	# This will be set when any elements of the object are changed
+	$self->{'dirty'} = 0;
+
+
+	# Calculate a proper uniqueIDseed if the user has not provided
+	# a correct one.
+	if ($self->{'uniqueIDseed'} <= ((dmRecordIDReservedRange + 1) << 12))
+	{
+		my $uniqueIDseed = 0;
+
+		do
+		{
+			$uniqueIDseed = int(rand(0x0FFF));
+
+		} while ($uniqueIDseed <= dmRecordIDReservedRange);
+
+		$self->{'uniqueIDseed'} = $uniqueIDseed << 12;
+		$self->{'uniqueIDseed'} &= 0x00FFF000;		# Isolate the upper 12 seed bits.
+	}
+
+	bless $self, $class;
+	return $self;
+}
+
+=head2 RegisterPDBHandlers
+
+  &Palm::PDB::RegisterPDBHandlers("classname", typespec...);
+
+Typically:
+
+  &Palm::PDB::RegisterPDBHandlers(__PACKAGE__,
+	[ "FooB", "DATA" ],
+	);
+
+The $pdb->L<Load()|/Load> method acts as a virtual constructor. When
+it reads the header of a C<.pdb> file, it looks up the file's creator
+and type in a set of tables, and reblesses $pdb into a class capable
+of parsing the application-specific parts of the file (AppInfo block,
+records, etc.)
+
+RegisterPDBHandlers() adds entries to these tables; it says that any
+file whose creator and/or type match any of the I<typespec>s (there
+may be several) should be reblessed into the class I<classname>.
+
+Note that RegisterPDBHandlers() applies only to record databases
+(C<.pdb> files). For resource databases, see
+L<RegisterPRCHandlers()|/RegisterPRCHandlers>.
+
+RegisterPDBHandlers() is typically called in the import() function of
+a helper class. In this case, the class is registering itself, and it
+is simplest just to use C<__PACKAGE__> for the package name:
+
+    package PalmFoo;
+    use Palm::PDB;
+
+    sub import
+    {
+        &Palm::PDB::RegisterPDBHandlers(__PACKAGE__,
+            [ "FooZ", "DATA" ]
+            );
+    }
+
+A I<typespec> can be either a string, or an anonymous array with two
+elements. If it is an anonymous array, then the first element is the
+file's creator; the second element is its type. If a I<typespec> is a
+string, it is equivalent to specifying that string as the database's
+creator, and a wildcard as its type.
+
+The creator and type should be either four-character strings, or the
+empty string. An empty string represents a wildcard. Thus:
+
+    &Palm::PDB::RegisterPDBHandlers("MyClass",
+        [ "fOOf", "DATA" ],
+        [ "BarB", "" ],
+        [ "", "BazQ" ],
+        "Fred"
+        );
+
+Class MyClass will handle:
+
+=over 4
+
+=item Z<>
+
+Databases whose creator is C<fOOf> and whose type is C<DATA>.
+
+=item Z<>
+
+Databases whose creator is C<BarB>, of any type.
+
+=item Z<>
+
+Databases with any creator whose type is C<BazQ>.
+
+=item Z<>
+
+Databases whose creator is C<Fred>, of any type.
+
+=back
+
+=for html </DL>
+<!-- Grrr... pod2html is broken, and doesn't terminate the list correctly -->
+
+=cut
+#'	<-- For Emacs.
+
+sub RegisterPDBHandlers
+{
+	my $handler = shift;		# Name of class that'll handle
+					# these databases
+	my @types = @_;
+	my $item;
+
+	foreach $item (@types)
+	{
+		if (ref($item) eq "ARRAY")
+		{
+			$PDBHandlers{$item->[0]}{$item->[1]} = $handler;
+		} else {
+			$PDBHandlers{$item}{""} = $handler;
+		}
+	}
+}
+
+=head2 RegisterPRCHandlers
+
+  &Palm::PDB::RegisterPRCHandlers("classname", typespec...);
+
+Typically:
+
+  &Palm::PDB::RegisterPRCHandlers(__PACKAGE__,
+	[ "FooZ", "CODE" ],
+	);
+
+RegisterPRCHandlers() is similar to
+L<RegisterPDBHandlers()|/RegisterPDBHandlers>, but specifies a class
+to handle resource database (C<.prc>) files.
+
+A class for parsing applications should begin with:
+
+    package PalmApps;
+    use Palm::PDB;
+
+    sub import
+    {
+        &Palm::PDB::RegisterPRCHandlers(__PACKAGE__,
+            [ "", "appl" ]
+            );
+    }
+
+=cut
+
+sub RegisterPRCHandlers
+{
+	my $handler = shift;		# Name of class that'll handle
+					# these databases
+	my @types = @_;
+	my $item;
+
+	foreach $item (@types)
+	{
+		if (ref($item) eq "ARRAY")
+		{
+			$PRCHandlers{$item->[0]}{$item->[1]} = $handler;
+		} else {
+			$PRCHandlers{$item}{""} = $handler;
+		}
+	}
+}
+
+=head2 Load
+
+  $pdb->Load($filename);
+
+Reads the file C<$filename>, parses it, reblesses $pdb to the
+appropriate class, and invokes appropriate methods to parse the
+application-specific parts of the database (see L</HELPER CLASSES>).
+
+C<$filename> may also be an open file handle (as long as it's
+seekable). This allows for manipulating databases in memory structures.
+
+Load() uses the I<typespec>s given to RegisterPDBHandlers() and
+RegisterPRCHandlers() when deciding how to rebless $pdb. For record
+databases, it uses the I<typespec>s passed to RegisterPDBHandlers(),
+and for resource databases, it uses the I<typespec>s passed to
+RegisterPRCHandlers().
+
+Load() looks for matching I<typespec>s in the following order, from
+most to least specific:
+
+=over 4
+
+=item 1
+
+A I<typespec> that specifies both the database's creator and its type
+exactly.
+
+=item 2
+
+A I<typespec> that specifies the database's type and has a wildcard
+for the creator (this is rarely used).
+
+=item 3
+
+A I<typespec> that specifies the database's creator and has a wildcard
+for the type.
+
+=item 4
+
+A I<typespec> that has wildcards for both the creator and type.
+
+=back
+
+=for html </OL>
+<!-- Grrr... pod2html is broken, and doesn't terminate the list correctly -->
+
+Thus, if the database has creator "FooZ" and type "DATA", Load() will
+first look for "FooZ"/"DATA", then ""/"DATA", then "FooZ"/"", and
+finally will fall back on ""/"" (the universal default).
+
+After Load() returns, $pdb may contain the following fields:
+
+=over
+
+=item $pdb-E<gt>{Z<>"name"Z<>}
+
+The name of the database.
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"ResDB"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"ReadOnly"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"AppInfoDirty"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"Backup"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"OKToInstallNewer"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"ResetAfterInstall"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"CopyPrevention"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"Stream"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"Hidden"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"LaunchableData"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"Recyclable"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"Bundle"Z<>}
+
+=item $pdb-E<gt>{Z<>"attributes"Z<>}{Z<>"Open"Z<>}
+
+These are the attribute flags from the database header. Each is true
+iff the corresponding flag is set.
+
+The "LaunchableData" attribute is set on PQAs.
+
+=item $pdb-E<gt>{Z<>"version"Z<>}
+
+The database's version number. An integer.
+
+=item $pdb-E<gt>{Z<>"ctime"Z<>}
+
+=item $pdb-E<gt>{Z<>"mtime"Z<>}
+
+=item $pdb-E<gt>{Z<>"baktime"Z<>}
+
+The database's creation time, last modification time, and time of last
+backup, in Unix C<time_t> format (seconds since Jan. 1, 1970).
+
+=item $pdb-E<gt>{Z<>"modnum"Z<>}
+
+The database's modification number. An integer.
+
+=item $pdb-E<gt>{Z<>"type"Z<>}
+
+The database's type. A four-character string.
+
+=item $pdb-E<gt>{Z<>"creator"Z<>}
+
+The database's creator. A four-character string.
+
+=item $pdb-E<gt>{Z<>"uniqueIDseed"Z<>}
+
+The database's unique ID seed. An integer.
+
+=item $pdb-E<gt>{Z<>"2NULs"Z<>}
+
+The two NUL bytes that appear after the record index and the AppInfo
+block. Included here because every once in a long while, they are not
+NULs, for some reason.
+
+=item $pdb-E<gt>{Z<>"appinfo"Z<>}
+
+The AppInfo block, as returned by the $pdb->ParseAppInfoBlock() helper
+method.
+
+=item $pdb-E<gt>{Z<>"sort"Z<>}
+
+The sort block, as returned by the $pdb->ParseSortBlock() helper
+method.
+
+=item @{$pdb-E<gt>{Z<>"records"Z<>}}
+
+The list of records in the database, as returned by the
+$pdb->ParseRecord() helper method. Resource databases do not have
+this.
+
+=item @{$pdb-E<gt>{Z<>"resources"Z<>}}
+
+The list of resources in the database, as returned by the
+$pdb->ParseResource() helper method. Record databases do not have
+this.
+
+=back
+
+All of these fields may be set by hand, but should conform to the
+format given above.
+
+=for html </DL>
+<!-- Grrr... pod2html is broken, and doesn't terminate the list correctly -->
+
+=cut
+#'
+
+# _open
+sub _open
+{
+	my($self, $mode, $fname) = @_;
+	
+	my $handle;
+	
+	if (ref($fname))
+	{
+		# Already a filehandle
+		if (ref($fname) eq 'GLOB' 
+		    or UNIVERSAL::isa($fname,"IO::Seekable"))
+		{
+			$handle = $fname;
+		}
+		# Probably a reference to a SCALAR
+		else
+		{
+			unless (eval 'open $handle, $mode, $fname')
+			{
+				if ($@ ne '')
+				{
+				    die "Open of \"$fname\" unsupported: $@\n";
+				}
+				else
+				{
+				    die "Can't open \"$fname\": $!\n";
+				}
+			}
+		}
+	}
+	else
+	{
+		# Before 5.6.0 "autovivified file handles" don't exist
+		eval 'use IO::File; $handle = new IO::File' if $] < 5.006;
+		open $handle, "$mode $fname" 
+		    or die "Can't open \"$fname\": $!\n";
+	}
+
+	return $handle;
+}
+
+# Load
+sub Load
+{
+	my $self = shift;
+	my $fname = shift;		# Filename to read from
+	my $buf;			# Buffer into which to read stuff
+
+	my $handle = $self->_open('<', $fname);
+	return undef unless defined $handle;
+
+	binmode $handle;	# Read as binary file under MS-DOS
+
+	# Get the size of the file. It'll be useful later
+	seek $handle, 0, 2;	# 2 == SEEK_END. Seek to the end.
+	$self->{_size} = tell $handle;
+	seek $handle, 0, 0;	# 0 == SEEK_START. Rewind to the beginning.
+
+	# Read header
+	my $name;
+	my $attributes;
+	my $version;
+	my $ctime;
+	my $mtime;
+	my $baktime;
+	my $modnum;
+	my $appinfo_offset;
+	my $sort_offset;
+	my $type;
+	my $creator;
+	my $uniqueIDseed;
+
+	read $handle, $buf, $HeaderLen;	# Read the PDB header
+
+	# Split header into its component fields
+	($name, $attributes, $version, $ctime, $mtime, $baktime,
+	$modnum, $appinfo_offset, $sort_offset, $type, $creator,
+	$uniqueIDseed) =
+		unpack "a32 n n N N N N N N a4 a4 N", $buf;
+
+	# database names must include a terminating NUL.
+	die "bogus database name! is this really a PalmOS file?" unless $name =~ /.+\0/;
+
+	($self->{name} = $name) =~ s/\0.*$//;
+	$self->{attributes}{resource} = 1 if $attributes & 0x0001;
+	$self->{attributes}{"read-only"} = 1 if $attributes & 0x0002;
+	$self->{attributes}{"AppInfo dirty"} = 1 if $attributes & 0x0004;
+	$self->{attributes}{backup} = 1 if $attributes & 0x0008;
+	$self->{attributes}{"OK newer"} = 1 if $attributes & 0x0010;
+	$self->{attributes}{reset} = 1 if $attributes & 0x0020;
+	$self->{attributes}{open} = 1 if $attributes & 0x8000;
+	$self->{attributes}{launchable} = 1 if $attributes & 0x0200;
+
+	# Attribute names as of PalmOS 5.0 ( see /Core/System/DataMgr.h )
+
+	$self->{'attributes'}{'ResDB'}			= 1 if $attributes & 0x0001; 
+	$self->{'attributes'}{'ReadOnly'}		= 1 if $attributes & 0x0002; 
+	$self->{'attributes'}{'AppInfoDirty'}		= 1 if $attributes & 0x0004; 
+	$self->{'attributes'}{'Backup'}			= 1 if $attributes & 0x0008; 
+	$self->{'attributes'}{'OKToInstallNewer'}	= 1 if $attributes & 0x0010; 
+	$self->{'attributes'}{'ResetAfterInstall'}	= 1 if $attributes & 0x0020; 
+	$self->{'attributes'}{'CopyPrevention'}		= 1 if $attributes & 0x0040; 
+	$self->{'attributes'}{'Stream'}			= 1 if $attributes & 0x0080; 
+	$self->{'attributes'}{'Hidden'}			= 1 if $attributes & 0x0100; 
+	$self->{'attributes'}{'LaunchableData'}		= 1 if $attributes & 0x0200; 
+	$self->{'attributes'}{'Recyclable'}		= 1 if $attributes & 0x0400; 
+	$self->{'attributes'}{'Bundle'}			= 1 if $attributes & 0x0800; 
+	$self->{'attributes'}{'Open'}			= 1 if $attributes & 0x8000; 
+
+
+	$self->{version} = $version;
+	$self->{ctime} = $ctime - $EPOCH_1904;
+	$self->{mtime} = $mtime - $EPOCH_1904;
+	$self->{orig_mtime} = $self->{mtime};
+	$self->{baktime} = $baktime - $EPOCH_1904;
+	$self->{modnum} = $modnum;
+	# _appinfo_offset and _sort_offset are private fields
+	$self->{_appinfo_offset} = $appinfo_offset;
+	$self->{_sort_offset} = $sort_offset;
+	$self->{type} = $type;
+	$self->{creator} = $creator;
+	$self->{uniqueIDseed} = $uniqueIDseed;
+
+	# XXX strictly speaking, ctime/mtime/baktime values before 1990 are quite
+	# unlikely. Palm was founded in 1992, so even allowing for some prototypes.
+	# This is another way one could detect bogus databases.
+
+	if( $self->{_appinfo_offset} > $self->{_size} ) {
+		die "AppInfo block offset beyond end of file!";
+	}
+	if( $self->{_sort_offset} > $self->{_size} ) {
+		die "Sort block offset beyond end of file!";
+	}
+
+	# Rebless this PDB object, depending on its type and/or
+	# creator. This allows us to magically invoke the proper
+	# &Parse*() function on the various parts of the database.
+
+	# Look for most specific handlers first, least specific ones
+	# last. That is, first look for a handler that deals
+	# specifically with this database's creator and type, then for
+	# one that deals with this database's creator and any type,
+	# and finally for one that deals with anything.
+
+	my $handler;
+	if ($self->{attributes}{resource} || $self->{'attributes'}{'ResDB'})
+	{
+		# Look among resource handlers
+		$handler = $PRCHandlers{$self->{creator}}{$self->{type}} ||
+			$PRCHandlers{undef}{$self->{type}} ||
+			$PRCHandlers{$self->{creator}}{""} ||
+			$PRCHandlers{""}{""};
+	} else {
+		# Look among record handlers
+		$handler = $PDBHandlers{$self->{creator}}{$self->{type}} ||
+			$PDBHandlers{""}{$self->{type}} ||
+			$PDBHandlers{$self->{creator}}{""} ||
+			$PDBHandlers{""}{""};
+	}
+
+	if (defined($handler))
+	{
+		bless $self, $handler;
+	} else {
+		# XXX - This should probably return 'undef' or something,
+		# rather than die.
+		die "No handler defined for creator \"$creator\", type \"$type\"\n";
+	}
+
+	## Read record/resource index
+	# Read index header
+	read $handle, $buf, $RecIndexHeaderLen;
+
+	my $next_index;
+	my $numrecs;
+
+	($next_index, $numrecs) = unpack "N n", $buf;
+	$self->{_numrecs} = $numrecs;
+
+	# Read the index itself
+	if ($self->{attributes}{resource} || $self->{'attributes'}{'ResDB'})
+	{
+		&_load_rsrc_index($self, $handle);
+	} else {
+		&_load_rec_index($self, $handle);
+	}
+
+	# Read the two NUL bytes
+	# XXX - Actually, these are bogus. They don't appear in the
+	# spec. The Right Thing to do is to ignore them, and use the
+	# specified or calculated offsets, if they're sane. Sane ==
+	# appears later than the current position.
+#	read $handle, $buf, 2;
+#	$self->{"2NULs"} = $buf;
+
+	# Read AppInfo block, if it exists
+	if ($self->{_appinfo_offset} != 0)
+	{
+		&_load_appinfo_block($self, $handle);
+	}
+
+	# Read sort block, if it exists
+	if ($self->{_sort_offset} != 0)
+	{
+		&_load_sort_block($self, $handle);
+	}
+
+	# Read record/resource list
+	if ($self->{attributes}{resource} || $self->{'attributes'}{'ResDB'})
+	{
+		&_load_resources($self, $handle);
+	} else {
+		&_load_records($self, $handle);
+	}
+
+	# These keys were needed for parsing the file, but are not
+	# needed any longer. Delete them.
+	delete $self->{_index};
+	delete $self->{_numrecs};
+	delete $self->{_appinfo_offset};
+	delete $self->{_sort_offset};
+	delete $self->{_size};
+
+	$self->{'dirty'} = 0;
+
+	return $self;
+}
+
+# _load_rec_index
+# Private function. Read the record index, for a record database
+sub _load_rec_index
+{
+	my $pdb = shift;
+	my $fh = shift;		# Input file handle
+	my $i;
+	my $lastoffset = 0;
+
+	# Read each record index entry in turn
+	for ($i = 0; $i < $pdb->{_numrecs}; $i++)
+	{
+		my $buf;		# Input buffer
+
+		# Read the next record index entry
+		my $offset;
+		my $attributes;
+		my @id;			# Raw ID
+		my $id;			# Numerical ID
+		my $entry = {};		# Parsed index entry
+
+		read $fh, $buf, $IndexRecLen;
+
+		# The ID field is a bit weird: it's represented as 3
+		# bytes, but it's really a double word (long) value.
+
+		($offset, $attributes, @id) = unpack "N C C3", $buf;
+
+		if ($offset == $lastoffset)
+		{
+			print STDERR "Record $i has same offset as previous one: $offset\n";
+		}
+
+		$lastoffset = $offset;
+
+		$entry->{offset} = $offset;
+
+		$entry->{attributes}{expunged} = 1 if $attributes & 0x80;
+		$entry->{attributes}{dirty} = 1 if $attributes & 0x40;
+		$entry->{attributes}{deleted} = 1 if $attributes & 0x20;
+		$entry->{attributes}{private} = 1 if $attributes & 0x10;
+
+		# Attribute names as of PalmOS 5.0 ( see /Core/System/DataMgr.h )
+
+		$entry->{'attributes'}{'Delete'}	= 1 if $attributes & 0x80;
+		$entry->{'attributes'}{'Dirty'}		= 1 if $attributes & 0x40;
+		$entry->{'attributes'}{'Busy'}		= 1 if $attributes & 0x20;
+		$entry->{'attributes'}{'Secret'}	= 1 if $attributes & 0x10;
+
+		$entry->{id} =	($id[0] << 16) |
+				($id[1] << 8)  |
+				 $id[2];
+
+		# The lower 4 bits of the attributes field are
+		# overloaded: If the record has been deleted and/or
+		# expunged, then bit 0x08 indicates whether the record
+		# should be archived. Otherwise (if it's an ordinary,
+		# non-deleted record), the lower 4 bits specify the
+		# category that the record belongs in.
+		if (($attributes & 0xa0) == 0)
+		{
+			$entry->{category} = $attributes & 0x0f;
+		} else {
+			$entry->{attributes}{archive} = 1
+				if $attributes & 0x08;
+		}
+
+		# Put this information on a temporary array
+		push @{$pdb->{_index}}, $entry;
+	}
+}
+
+# _load_rsrc_index
+# Private function. Read the resource index, for a resource database
+sub _load_rsrc_index
+{
+	my $pdb = shift;
+	my $fh = shift;		# Input file handle
+	my $i;
+
+	# Read each resource index entry in turn
+	for ($i = 0; $i < $pdb->{_numrecs}; $i++)
+	{
+		my $buf;		# Input buffer
+
+		# Read the next resource index entry
+		my $type;
+		my $id;
+		my $offset;
+		my $entry = {};		# Parsed index entry
+
+		read $fh, $buf, $IndexRsrcLen;
+
+		($type, $id, $offset) = unpack "a4 n N", $buf;
+
+		$entry->{type} = $type;
+		$entry->{id} = $id;
+		$entry->{offset} = $offset;
+
+		push @{$pdb->{_index}}, $entry;
+	}
+}
+
+# _load_appinfo_block
+# Private function. Read the AppInfo block
+sub _load_appinfo_block
+{
+	my $pdb = shift;
+	my $fh = shift;		# Input file handle
+	my $len;		# Length of AppInfo block
+	my $buf;		# Input buffer
+
+	# Sanity check: make sure we're positioned at the beginning of
+	# the AppInfo block
+	if (tell($fh) > $pdb->{_appinfo_offset})
+	{
+		die "Bad AppInfo offset: expected ",
+			sprintf("0x%08x", $pdb->{_appinfo_offset}),
+			", but I'm at ",
+			tell($fh), "\n";
+	}
+
+	# Seek to the right place, if necessary
+	if (tell($fh) != $pdb->{_appinfo_offset})
+	{
+		seek $fh, $pdb->{_appinfo_offset}, 0;
+	}
+
+	# There's nothing that explicitly gives the size of the
+	# AppInfo block. Rather, it has to be inferred from the offset
+	# of the AppInfo block (previously recorded in
+	# $pdb->{_appinfo_offset}) and whatever's next in the file.
+	# That's either the sort block, the first data record, or the
+	# end of the file.
+
+	if ($pdb->{_sort_offset})
+	{
+		# The next thing in the file is the sort block
+		$len = $pdb->{_sort_offset} - $pdb->{_appinfo_offset};
+	} elsif ((defined $pdb->{_index}) && @{$pdb->{_index}})
+	{
+		# There's no sort block; the next thing in the file is
+		# the first data record
+		$len = $pdb->{_index}[0]{offset} -
+			$pdb->{_appinfo_offset};
+	} else {
+		# There's no sort block and there are no records. The
+		# AppInfo block goes to the end of the file.
+		$len = $pdb->{_size} - $pdb->{_appinfo_offset};
+	}
+
+	# Read the AppInfo block
+	read $fh, $buf, $len;
+
+	# Tell the real class to parse the AppInfo block
+	$pdb->{appinfo} = $pdb->ParseAppInfoBlock($buf);
+}
+
+# _load_sort_block
+# Private function. Read the sort block.
+sub _load_sort_block
+{
+	my $pdb = shift;
+	my $fh = shift;		# Input file handle
+	my $len;		# Length of sort block
+	my $buf;		# Input buffer
+
+	# Sanity check: make sure we're positioned at the beginning of
+	# the sort block
+	if (tell($fh) > $pdb->{_sort_offset})
+	{
+		die "Bad sort block offset: expected ",
+			sprintf("0x%08x", $pdb->{_sort_offset}),
+			", but I'm at ",
+			tell($fh), "\n";
+	}
+
+	# Seek to the right place, if necessary
+	if (tell($fh) != $pdb->{_sort_offset})
+	{
+		seek $fh, $pdb->{_sort_offset}, 0;
+	}
+
+	# There's nothing that explicitly gives the size of the sort
+	# block. Rather, it has to be inferred from the offset of the
+	# sort block (previously recorded in $pdb->{_sort_offset})
+	# and whatever's next in the file. That's either the first
+	# data record, or the end of the file.
+
+	if (defined($pdb->{_index}))
+	{
+		# The next thing in the file is the first data record
+		$len = $pdb->{_index}[0]{offset} -
+			$pdb->{_sort_offset};
+	} else {
+		# There are no records. The sort block goes to the end
+		# of the file.
+		$len = $pdb->{_size} - $pdb->{_sort_offset};
+	}
+
+	# Read the AppInfo block
+	read $fh, $buf, $len;
+
+	# XXX - Check to see if the sort block has some predefined
+	# structure. If so, it might be a good idea to parse the sort
+	# block here.
+
+	# Tell the real class to parse the sort block
+	$pdb->{sort} = $pdb->ParseSortBlock($buf);
+}
+
+# _load_records
+# Private function. Load the actual data records, for a record database
+# (PDB)
+sub _load_records
+{
+	my $pdb = shift;
+	my $fh = shift;		# Input file handle
+	my $i;
+
+	# Read each record in turn
+	for ($i = 0; $i < $pdb->{_numrecs}; $i++)
+	{
+		my $len;	# Length of record
+		my $buf;	# Input buffer
+
+		# Sanity check: make sure we're where we think we
+		# should be.
+		if (tell($fh) > $pdb->{_index}[$i]{offset})
+		{
+			die "Bad offset for record $i: expected ",
+				sprintf("0x%08x",
+					$pdb->{_index}[$i]{offset}),
+				" but it's at ",
+				sprintf("[0x%08x]", tell($fh)), "\n";
+		}
+		
+		if( $pdb->{_index}[$i]{offset} > $pdb->{_size} ) {
+			die "corruption: Record $i beyond end of database!";
+		}
+
+		# Seek to the right place, if necessary
+		if (tell($fh) != $pdb->{_index}[$i]{offset})
+		{
+			seek $fh, $pdb->{_index}[$i]{offset}, 0;
+		}
+
+		# Compute the length of the record: the last record
+		# extends to the end of the file. The others extend to
+		# the beginning of the next record.
+		if ($i == $pdb->{_numrecs} - 1)
+		{
+			# This is the last record
+			$len = $pdb->{_size} -
+				$pdb->{_index}[$i]{offset};
+		} else {
+			# This is not the last record
+			$len = $pdb->{_index}[$i+1]{offset} -
+				$pdb->{_index}[$i]{offset};
+		}
+
+		# Read the record
+		read $fh, $buf, $len;
+
+		# Tell the real class to parse the record data. Pass
+		# &ParseRecord all of the information from the index,
+		# plus a "data" field with the raw record data.
+		my $record;
+
+		$record = $pdb->ParseRecord(
+			%{$pdb->{_index}[$i]},
+			"data"	=> $buf,
+			);
+		push @{$pdb->{records}}, $record;
+	}
+}
+
+# _load_resources
+# Private function. Load the actual data resources, for a resource database
+# (PRC)
+sub _load_resources
+{
+	my $pdb = shift;
+	my $fh = shift;		# Input file handle
+	my $i;
+
+	# Read each resource in turn
+	for ($i = 0; $i < $pdb->{_numrecs}; $i++)
+	{
+		my $len;	# Length of record
+		my $buf;	# Input buffer
+
+		# Sanity check: make sure we're where we think we
+		# should be.
+		if (tell($fh) > $pdb->{_index}[$i]{offset})
+		{
+			die "Bad offset for resource $i: expected ",
+				sprintf("0x%08x",
+					$pdb->{_index}[$i]{offset}),
+				" but it's at ",
+				sprintf("0x%08x", tell($fh)), "\n";
+		}
+
+		if( $pdb->{_index}[$i]{offset} > $pdb->{_size} ) {
+			die "corruption: Resource $i beyond end of database!";
+		}
+
+		# Seek to the right place, if necessary
+		if (tell($fh) != $pdb->{_index}[$i]{offset})
+		{
+			seek $fh, $pdb->{_index}[$i]{offset}, 0;
+		}
+
+		# Compute the length of the resource: the last
+		# resource extends to the end of the file. The others
+		# extend to the beginning of the next resource.
+		if ($i == $pdb->{_numrecs} - 1)
+		{
+			# This is the last resource
+			$len = $pdb->{_size} -
+				$pdb->{_index}[$i]{offset};
+		} else {
+			# This is not the last resource
+			$len = $pdb->{_index}[$i+1]{offset} -
+				$pdb->{_index}[$i]{offset};
+		}
+
+		# Read the resource
+		read $fh, $buf, $len;
+
+		# Tell the real class to parse the resource data. Pass
+		# &ParseResource all of the information from the
+		# index, plus a "data" field with the raw resource
+		# data.
+		my $resource;
+
+		$resource = $pdb->ParseResource(
+			%{$pdb->{_index}[$i]},
+			"data"	=> $buf,
+			);
+		push @{$pdb->{resources}}, $resource;
+	}
+}
+
+=head2 Write
+
+  $pdb->Write($filename);
+
+Invokes methods in helper classes to get the application-specific
+parts of the database, then writes the database to the file
+C<$filename>.
+
+C<$filename> may also be an open file handle (as long as it's
+seekable). This allows for manipulating databases in memory structures.
+
+Write() uses the following helper methods:
+
+=over
+
+=item Z<>
+
+PackAppInfoBlock()
+
+=item Z<>
+
+PackSortBlock()
+
+=item Z<>
+
+PackResource() or PackRecord()
+
+=back
+
+=for html </DL>
+<!-- Grrr... pod2html is broken, and doesn't terminate the list correctly -->
+
+See also L</HELPER CLASSES>.
+
+=cut
+#'	<-- For Emacs
+
+sub Write
+{
+	my $self = shift;
+	my $fname = shift;		# Output file name
+	my @record_data;
+
+	die "Can't write a database with no name\n"
+		unless $self->{name} ne "";
+
+	my $handle = $self->_open('>', $fname);
+	return undef unless defined $handle;
+
+	# Open file
+	binmode $handle;	# Write as binary file under MS-DOS
+
+	# Get AppInfo block
+	my $appinfo_block = $self->PackAppInfoBlock;
+
+	# Get sort block
+	my $sort_block = $self->PackSortBlock;
+
+	my $index_len;
+
+	# Get records or resources
+	if ($self->{attributes}{resource} || $self->{'attributes'}{'ResDB'})
+	{
+		# Resource database
+		my $resource;
+
+		foreach $resource (@{$self->{resources}})
+		{
+			my $type;
+			my $id;
+			my $data;
+
+			# Get all the stuff that goes in the index, as
+			# well as the resource data.
+			$type = $resource->{type};
+			$id = $resource->{id};
+			$data = $self->PackResource($resource);
+
+			push @record_data, [ $type, $id, $data ];
+		}
+		# Figure out size of index
+		$index_len = $RecIndexHeaderLen +
+			($#record_data + 1) * $IndexRsrcLen;
+	} else {
+		my $record;
+
+		foreach $record (@{$self->{records}})
+		{
+			my $attributes;
+			my $id;
+			my $data;
+
+			# XXX - Should probably check the length of this
+			# record and not add it to the record if it's 0.
+
+			# Get all the stuff that goes in the index, as
+			# well as the record data.
+			$attributes = 0;
+			if ($record->{attributes}{expunged} ||
+			    $record->{attributes}{deleted})
+			{
+				$attributes |= 0x08
+					if $record->{attributes}{archive};
+			} else {
+				$attributes = ($record->{category} & 0x0f);
+			}
+			$attributes |= 0x80
+				if $record->{attributes}{expunged};
+			$attributes |= 0x40
+				if $record->{attributes}{dirty};
+			$attributes |= 0x20
+				if $record->{attributes}{deleted};
+			$attributes |= 0x10
+				if $record->{attributes}{private};
+
+			$attributes |= 0x80 if $record->{'attributes'}{'Delete'};
+			$attributes |= 0x40 if $record->{'attributes'}{'Dirty'};
+			$attributes |= 0x20 if $record->{'attributes'}{'Busy'};
+			$attributes |= 0x10 if $record->{'attributes'}{'Secret'};
+
+			$id = $record->{id};
+
+			$data = $self->PackRecord($record);
+
+			push @record_data, [ $attributes, $id, $data ];
+		}
+		# Figure out size of index
+		$index_len = $RecIndexHeaderLen +
+			($#record_data + 1) * $IndexRecLen;
+	}
+
+	my $header;
+	my $attributes = 0x0000;
+	my $appinfo_offset;
+	my $sort_offset;
+
+	# Build attributes field
+	$attributes =
+		($self->{attributes}{resource}	? 0x0001 : 0) |
+		($self->{attributes}{"read-only"}	? 0x0002 : 0) |
+		($self->{attributes}{"AppInfo dirty"}	? 0x0004 : 0) |
+		($self->{attributes}{backup}	? 0x0008 : 0) |
+		($self->{attributes}{"OK newer"}	? 0x0010 : 0) |
+		($self->{attributes}{reset}		? 0x0020 : 0) |
+		($self->{attributes}{open}		? 0x8000 : 0);
+
+	$attributes |= 0x0001 if $self->{'attributes'}{'ResDB'};
+	$attributes |= 0x0002 if $self->{'attributes'}{'ReadOnly'};
+	$attributes |= 0x0004 if $self->{'attributes'}{'AppInfoDirty'};
+	$attributes |= 0x0008 if $self->{'attributes'}{'Backup'};
+	$attributes |= 0x0010 if $self->{'attributes'}{'OKToInstallNewer'};
+	$attributes |= 0x0020 if $self->{'attributes'}{'ResetAfterInstall'};
+	$attributes |= 0x0040 if $self->{'attributes'}{'CopyPrevention'};
+	$attributes |= 0x0080 if $self->{'attributes'}{'Stream'};
+	$attributes |= 0x0100 if $self->{'attributes'}{'Hidden'};
+	$attributes |= 0x0200 if $self->{'attributes'}{'LaunchableData'};
+	$attributes |= 0x0400 if $self->{'attributes'}{'Recyclable'};
+	$attributes |= 0x0800 if $self->{'attributes'}{'Bundle'};
+	$attributes |= 0x8000 if $self->{'attributes'}{'Open'};	
+
+
+	# Calculate AppInfo block offset
+	if ((!defined($appinfo_block)) || ($appinfo_block eq ""))
+	{
+		# There's no AppInfo block
+		$appinfo_offset = 0;
+	} else {
+		# Offset of AppInfo block from start of file
+		$appinfo_offset = $HeaderLen + $index_len + 2;
+	}
+
+	# Calculate sort block offset
+	if ((!defined($sort_block)) || ($sort_block eq ""))
+	{
+		# There's no sort block
+		$sort_offset = 0;
+	} else {
+		# Offset of sort block...
+		if ($appinfo_offset == 0)
+		{
+			# ...from start of file
+			$sort_offset = $HeaderLen + $index_len + 2;
+		} else {
+			# ...or just from start of AppInfo block
+			$sort_offset = $appinfo_offset +
+				length($appinfo_block);
+		}
+	}
+
+	# Write header
+	#print "TIME $self->{ctime} $self->{mtime} $self->{baktime}\n";
+	$header = pack "a32 n n N N N N N N a4 a4 N",
+		$self->{name},
+		$attributes,
+		$self->{version},
+		$self->{ctime} + $EPOCH_1904,
+		$self->{mtime} + $EPOCH_1904,
+		$self->{baktime} + $EPOCH_1904,
+		$self->{modnum},
+		$appinfo_offset,
+		$sort_offset,
+		$self->{type},
+		$self->{creator},
+		$self->{uniqueIDseed};
+		;
+
+	print $handle "$header";
+
+	# Write index header
+	my $index_header;
+
+	$index_header = pack "N n", 0, ($#record_data+1);
+	print $handle "$index_header";
+
+	# Write index
+	my $rec_offset;		# Offset of next record/resource
+
+	# Calculate offset of first record/resource
+	if ($sort_offset != 0)
+	{
+		$rec_offset = $sort_offset + length($sort_block);
+	} elsif ($appinfo_offset != 0)
+	{
+		$rec_offset = $appinfo_offset + length($appinfo_block);
+	} else {
+		$rec_offset = $HeaderLen + $index_len + 2;
+	}
+
+	if ($self->{attributes}{resource} || $self->{'attributes'}{'ResDB'})
+	{
+		# Resource database
+		# Record database
+		my $rsrc_data;
+
+		foreach $rsrc_data (@record_data)
+		{
+			my $type;
+			my $id;
+			my $data;
+			my $index_data;
+
+			($type, $id, $data) = @{$rsrc_data};
+			$index_data = pack "a4 n N",
+				$type,
+				$id,
+				$rec_offset;
+			print $handle "$index_data";
+
+			$rec_offset += length($data);
+		}
+	} else {
+		# Record database
+		my $rec_data;
+
+		foreach $rec_data (@record_data)
+		{
+			my $attributes;
+			my $data;
+			my $id;
+			my $index_data;
+
+			# XXX - Probably shouldn't write this record if
+			# length($data) == 0
+			($attributes, $id, $data) = @{$rec_data};
+
+			if (length($data) == 0)
+			{
+				warn printf("Write: Warning: record 0x%08x has length 0\n", $id)
+			}
+
+			$index_data = pack "N C C3",
+				$rec_offset,
+				$attributes,
+				($id >> 16) & 0xff,
+				($id >> 8) & 0xff,
+				$id & 0xff;
+			print $handle "$index_data";
+
+			$rec_offset += length($data);
+		}
+	}
+
+	# Write the two NULs
+	if (length($self->{"2NULs"}) == 2)
+	{
+		print $handle $self->{"2NULs"};
+	} else {
+		print $handle "\0\0";
+	}
+
+	# Write AppInfo block
+	print $handle $appinfo_block unless $appinfo_offset == 0;
+
+	# Write sort block
+	print $handle $sort_block unless $sort_offset == 0;
+
+	# Write record/resource list
+	my $record;
+	foreach $record (@record_data)
+	{
+		my $data;
+
+		if ($self->{attributes}{resource} || $self->{'attributes'}{'ResDB'})
+		{
+			# Resource database
+			my $type;
+			my $id;
+
+			($type, $id, $data) = @{$record};
+		} else {
+			my $attributes;
+			my $id;
+
+			($attributes, $id, $data) = @{$record};
+		}
+		print $handle $data;
+	}
+
+	return $self;
+}
+
+=head2 new_Record
+
+  $record = Palm::PDB->new_Record();
+  $record = new_Record Palm::PDB;
+
+Creates a new record, with the bare minimum needed:
+
+	$record->{'category'}
+	$record->{'attributes'}{'Dirty'}
+	$record->{'id'}
+
+The ``Dirty'' attribute is originally set, since this function will
+usually be called to create records to be added to a database.
+
+C<new_Record> does B<not> add the new record to a PDB. For that,
+you want C<append_Record>.
+
+=cut
+
+# PDB::new_Record()
+# Create a new, initialized record, and return a reference to it.
+# The record is initially marked as being dirty, since that's usually
+# the Right Thing.
+sub new_Record
+{
+	my $classname = shift;
+	my $retval = {};
+
+	# Initialize the record
+	$retval->{'category'} = 0;	# Unfiled, by convention
+	$retval->{'attributes'} = {
+#		expunged	=> 0,
+		dirty		=> 1,	# Note: originally dirty
+		'Dirty'		=> 1,
+#		deleted		=> 0,
+#		private		=> 0,
+#		archive         => 0,
+	};
+	$retval->{'id'} = 0;		# Initially, no record ID
+
+	return $retval;
+}
+
+=head2 is_Dirty
+
+  $pdb->Write( $fname ) if $pdb->is_Dirty();
+
+Returns non-zero if any of the in-memory elements of the database have
+been changed. This includes changes via function calls (any call that
+changes the C<$pdb>'s "last modification" time) as well as testing the
+"dirty" status of attributes where possible (i.e. AppInfo, records,
+but not resource entries).
+
+=cut
+#'
+
+sub is_Dirty
+{
+	my $self = shift;
+
+	# try the quick and easy tests first
+	return 1 if $self->{'dirty'};
+	return 1 if $self->{'attributes'}{'AppInfoDirty'};
+	return 1 if $self->{'attributes'}{'AppInfo dirty'};
+
+	# okay, check the records. Note that resource entries appear to
+	# have no dirty flags for us to use.
+	if (!$self->{attributes}{resource} and !$self->{'attributes'}{'ResDB'})
+	{
+		my $record;
+
+		foreach $record (@{$self->{records}})
+		{
+			return 1 if $record->{'attributes'}{'Dirty'};
+			return 1 if $record->{'attributes'}{'dirty'};
+		}
+	}
+
+	return 0;
+}
+
+=head2 append_Record
+
+  $record  = $pdb->append_Record;
+  $record2 = $pdb->append_Record($record1);
+
+If called without any arguments, creates a new record with
+L<new_Record()|/new_Record>, and appends it to $pdb.
+
+If given a reference to a record, appends that record to
+@{$pdb->{records}}.
+
+Returns a reference to the newly-appended record.
+
+This method updates $pdb's "last modification" time.
+
+=cut
+#'
+
+# append_Record
+# Append the given records to the database's list of records. If no
+# records are given, create one, append it, and return a reference to
+# it.
+sub append_Record
+{
+	my $self = shift;
+
+	if ($#_ < 0)
+	{
+		# No arguments given. Create a new record.
+		my $record = $self->new_Record;
+
+		# Validate the unique ID.
+		$self->_setUniqueID($record)
+			if $record->{'id'} eq 0;
+
+		push @{$self->{records}}, $record;
+
+		# Update the "last modification time".
+		$self->{mtime} = time;
+		$self->{dirty} = 1;
+
+		return $record;
+	}
+
+	# Validate the unique IDs.
+	foreach my $record (@_)
+	{
+		$self->_setUniqueID($record)
+			if $record->{'id'} eq 0;
+	}
+
+	# At least one argument was given. Append all of the arguments
+	# to the list of records, and return the first one.
+	push @{$self->{records}}, @_;
+
+	# Update the "last modification time".
+	$self->{mtime} = time;
+	$self->{'dirty'} = 1;
+
+	return $_[0];
+}
+
+sub _setUniqueID
+{
+	my($self, $record) = @_;
+
+	# Bump the seed to prevent a uniqueIDseed of 0 which represents
+	# an unassigned uniqueID.
+	# XXX IMHO this just couldn't happen given the way the seed it's
+	# generated. But if Palm OS goes this way maybe it's better to do
+	# the same.
+
+	$self->{'uniqueIDseed'}++;
+
+	# Check for wrap around. Remember that an uniqueID is made of only 24 bits.
+	$self->{'uniqueIDseed'} = (dmRecordIDReservedRange + 1) << 12
+		if ($self->{'uniqueIDseed'} & 0xFF000000);
+
+	# Copy the seed into the new record.
+	$record->{'id'} = $self->{'uniqueIDseed'};
+}
+
+=head2 new_Resource
+
+  $resource = Palm::PDB->new_Resource();
+  $resource = new_Resource Palm::PDB;
+
+Creates a new resource and initializes
+
+	$resource->{type}
+	$resource->{id}
+
+=cut
+
+# new_Resource
+# Create a new, initialized resource, and return a reference to it.
+sub new_Resource
+{
+	my $classname = shift;
+	my $retval = {};
+
+	# Initialize the resource
+	$retval->{type} = "\0\0\0\0";
+	$retval->{id} = 0;
+
+	return $retval;
+}
+
+=head2 append_Resource
+
+  $resource  = $pdb->append_Resource;
+  $resource2 = $pdb->append_Resource($resource1);
+
+If called without any arguments, creates a new resource with
+L<new_Resource()|/new_Resource>, and appends it to $pdb.
+
+If given a reference to a resource, appends that resource to
+@{$pdb->{resources}}.
+
+Returns a reference to the newly-appended resource.
+
+This method updates $pdb's "last modification" time.
+
+=cut
+#'
+
+# append_Resource
+# Append the given resources to the database's list of resources. If no
+# resources are given, create one, append it, and return a reference to
+# it.
+sub append_Resource
+{
+	my $self = shift;
+
+	if ($#_ < 0)
+	{
+		# No arguments given. Create a new resource
+		my $resource = $self->new_Resource;
+
+		push @{$self->{resources}}, $resource;
+
+		# Update the "last modification time".
+		$self->{mtime} = time;
+		$self->{'dirty'} = 1;
+
+		return $resource;
+	}
+
+	# At least one argument was given. Append all of the arguments
+	# to the list of resources, and return the first one.
+	push @{$self->{resources}}, @_;
+
+	# Update the "last modification time".
+	$self->{mtime} = time;
+	$self->{'dirty'} = 1;
+
+	return $_[0];
+}
+
+=head2 findRecordByID
+
+  $record = $pdb->findRecordByID($id);
+
+Looks through the list of records in $pdb, and returns a reference to
+the record with ID $id, or the undefined value if no such record was
+found.
+
+=cut
+
+# findRecordByID
+# Returns a reference to the record with the given ID, or 'undef' if
+# it doesn't exist.
+sub findRecordByID
+{
+	my $self = shift;
+	my $id = shift;
+
+	return undef if $id eq "";
+
+	for (@{$self->{records}})
+	{
+		next unless $_->{id} == $id;
+		return $_;		# Found it
+	}
+
+	return undef;			# Not found
+}
+
+=head2 delete_Record
+
+  $pdb->delete_Record($record, $expunge);
+
+Marks $record for deletion, so that it will be deleted from the
+database at the next sync.
+
+If $expunge is false or omitted, the record will be marked
+for deletion with archival. If $expunge is true, the record will be
+marked for deletion without archival.
+
+This method updates $pdb's "last modification" time.
+
+=cut
+#'
+
+# delete_Record
+# $pdb->delete_Record($record ?, $expunge?)
+#
+# Mark the given record for deletion. If $expunge is true, mark the
+# record for deletion without an archive.
+
+sub delete_Record
+{
+	my $self = shift;
+	my $record = shift;
+	my $expunge = shift;
+
+	$record->{attributes}{deleted} = 1;
+	if ($expunge)
+	{
+		$record->{attributes}{expunged} = 1;
+		$record->{attributes}{archive} = 0;
+	} else {
+		$record->{attributes}{expunged} = 0;
+		$record->{attributes}{archive} = 1;
+	}
+
+	# Update the "last modification time".
+	$self->{mtime} = time;
+	$self->{'dirty'} = 1;
+}
+
+=head2 remove_Record
+
+	for (@{$pdb->{'records'}})
+	{
+		$pdb->remove_Record( $_ ) if $_->{attributes}{deleted};
+	}
+
+Removes C<$record> from the database. This differs from C<delete_Record>
+in that it's an actual deletion rather than just setting a flag.
+
+This method updates $pdb's "last modification" time.
+
+=cut
+#'
+
+sub remove_Record($$)
+{
+	my $self = shift;
+	my $record = shift;
+
+	for (my $i = 0; $i <= $#{$self->{records}}; $i ++)
+	{
+		if ($self->{records}->[$i] == $record)
+		{
+			# make a copy of the records array. This is really necessary
+			# because there's frequently something using the records reference
+			# for iteration purposes (like the doc example) and we can't
+			# just start splicing that apart (tried, failed).
+			# So we have to make a new copy. This does, unfortunately,
+			# make remove_Record() more expensive that you'd expect.
+			$self->{records} = [ @{$self->{records}} ];
+
+			# remove the record index.
+			splice @{$self->{records}}, $i, 1;
+
+			$self->{mtime} = time;
+			$self->{'dirty'} = 1;
+
+			last;
+		}
+	}
+}
+
+=head1 HELPER CLASSES
+
+$pdb->Load() reblesses $pdb into a new class. This helper class is
+expected to convert raw data from the database into parsed
+representations of it, and vice-versa.
+
+A helper class must have all of the methods listed below. The
+Palm::Raw class is useful if you don't want to define all of the
+required methods.
+
+
+=head2 ParseAppInfoBlock
+
+  $appinfo = $pdb->ParseAppInfoBlock($buf);
+
+$buf is a string of raw data. ParseAppInfoBlock() should parse this
+data and return it, typically in the form of a reference to an object
+or to an anonymous hash.
+
+This method will not be called if the database does not have an
+AppInfo block.
+
+The return value from ParseAppInfoBlock() will be accessible as
+$pdb->{appinfo}.
+
+=head2 PackAppInfoBlock
+
+  $buf = $pdb->PackAppInfoBlock();
+
+This is the converse of ParseAppInfoBlock(). It takes $pdb's AppInfo
+block, $pdb->{appinfo}, and returns a string of binary data
+that can be written to the database file.
+
+=head2 ParseSortBlock
+
+  $sort = $pdb->ParseSortBlock($buf);
+
+$buf is a string of raw data. ParseSortBlock() should parse this data
+and return it, typically in the form of a reference to an object or to
+an anonymous hash.
+
+This method will not be called if the database does not have a sort
+block.
+
+The return value from ParseSortBlock() will be accessible as
+$pdb->{sort}.
+
+=head2 PackSortBlock
+
+  $buf = $pdb->PackSortBlock();
+
+This is the converse of ParseSortBlock(). It takes $pdb's sort block,
+$pdb->{sort}, and returns a string of raw data that can be
+written to the database file.
+
+=head2 ParseRecord
+
+  $record = $pdb->ParseRecord(
+          offset         => $offset,	# Record's offset in file
+          attributes     =>		# Record attributes
+              {
+        	expunged => bool,	# True iff expunged
+        	dirty    => bool,	# True iff dirty
+        	deleted  => bool,	# True iff deleted
+        	private  => bool,	# True iff private
+	        archive  => bool,       # True iff to be archived
+              },
+          category       => $category,	# Record's category number
+          id             => $id,	# Record's unique ID
+          data           => $buf,	# Raw record data
+        );
+
+ParseRecord() takes the arguments listed above and returns a parsed
+representation of the record, typically as a reference to a record
+object or anonymous hash.
+
+The output from ParseRecord() will be appended to
+@{$pdb->{records}}. The records appear in this list in the
+same order as they appear in the file.
+
+$offset argument is not normally useful, but is included for
+completeness.
+
+The fields in %$attributes are boolean values. They are true iff the
+record has the corresponding flag set.
+
+$category is an integer in the range 0-15, which indicates which
+category the record belongs to. This is normally an index into a table
+given at the beginning of the AppInfo block.
+
+A typical ParseRecord() method has this general form:
+
+    sub ParseRecord
+    {
+        my $self = shift
+        my %record = @_;
+
+        # Parse $self->{data} and put the fields into new fields in
+        # $self.
+
+        delete $record{data};		# No longer useful
+        return \%record;
+    }
+
+=head2 PackRecord
+
+  $buf = $pdb->PackRecord($record);
+
+The converse of ParseRecord(). PackRecord() takes a record as returned
+by ParseRecord() and returns a string of raw data that can be written
+to the database file.
+
+PackRecord() is never called when writing a resource database.
+
+=head2 ParseResource
+
+  $record = $pdb->ParseResource(
+          type   => $type,		# Resource type
+          id     => $id,		# Resource ID
+          offset => $offset,		# Resource's offset in file
+          data   => $buf,		# Raw resource data
+        );
+
+ParseResource() takes the arguments listed above and returns a parsed
+representation of the resource, typically as a reference to a resource
+object or anonymous hash.
+
+The output from ParseResource() will be appended to
+@{$pdb->{resources}}. The resources appear in this list in
+the same order as they appear in the file.
+
+$type is a four-character string giving the resource's type.
+
+$id is an integer that uniquely identifies the resource amongst others
+of its type.
+
+$offset is not normally useful, but is included for completeness.
+
+=head2 PackResource
+
+  $buf = $pdb->PackResource($resource);
+
+The converse of ParseResource(). PackResource() takes a resource as
+returned by PackResource() and returns a string of raw data that can
+be written to the database file.
+
+PackResource() is never called when writing a record database.
+
+=head1 BUGS
+
+These functions die too easily. They should return an error code.
+
+Database manipulation is still an arcane art.
+
+It may be possible to parse sort blocks further.
+
+=head1 SOURCE CONTROL
+
+The source is in Github:
+
+	http://github.com/briandfoy/p5-Palm/tree/master
+	
+=head1 AUTHOR
+
+Alessandro Zummo, C<< <a.zummo@towertech.it> >>
+
+Currently maintained by brian d foy, C<< <bdfoy@cpan.org> >>
+
+=head1 SEE ALSO
+
+Palm::Raw(3)
+
+Palm::Address(3)
+
+Palm::Datebook(3)
+
+Palm::Mail(3)
+
+Palm::Memo(3)
+
+Palm::ToDo(3)
+
+F<Palm Database Files>, in the ColdSync distribution.
+
+The Virtual Constructor (aka Factory Method) pattern is described in
+F<Design Patterns>, by Erich Gamma I<et al.>, Addison-Wesley.
+
+=cut
+
+}
+
+package Palm::Raw; BEGIN { $INC{"Palm/Raw.pm"} = "Palm/Raw.pm" }
+BEGIN {
+# Palm::Raw.pm
+# 
+# Perl class for dealing with "raw" PDB databases. A "raw" database is
+# one where the AppInfo and sort blocks, and all of the
+# records/resources, are just strings of bytes.
+# This is useful as a default PDB handler, for cases where you want to
+# be able to handle any kind of database in a generic fashion.
+# You may also find it useful to subclass this class, for cases where
+# you don't care about every type of thing in a database.
+#
+#	Copyright (C) 1999, 2000, Andrew Arensburger.
+#	You may distribute this file under the terms of the Artistic
+#	License, as specified in the README file.
+
+use strict;
+package Palm::Raw;
+use Palm::PDB;
+use vars qw( $VERSION @ISA );
+
+# One liner, to allow MakeMaker to work.
+$VERSION = '1.012';
+
+@ISA = qw( Palm::PDB );
+
+=head1 NAME
+
+Palm::Raw - Handler for "raw" Palm databases.
+
+=head1 SYNOPSIS
+
+    use Palm::Raw;
+
+For standalone programs.
+
+    use Palm::Raw();
+    @ISA = qw( Palm::Raw );
+
+For Palm::PDB helper modules.
+
+=head1 DESCRIPTION
+
+The Raw PDB handler is a helper class for the Palm::PDB package. It is
+intended as a generic handler for any database, or as a fallback
+default handler.
+
+If you have a standalone program and want it to be able to parse any
+type of database, use
+
+    use Palm::Raw;
+
+If you are using Palm::Raw as a parent class for your own database
+handler, use
+
+    use Palm::Raw();
+
+If you omit the parentheses, Palm::Raw will register itself as the
+default handler for all databases, which is probably not what you
+want.
+
+The Raw handler does no processing on the database whatsoever. The
+AppInfo block, sort block, records and resources are simply strings,
+raw data from the database.
+
+By default, the Raw handler only handles record databases (.pdb
+files). If you want it to handle resource databases (.prc files) as
+well, you need to call
+
+    &Palm::PDB::RegisterPRCHandlers("Palm::Raw", "");
+
+in your script.
+
+=head2 AppInfo block
+
+    $pdb->{appinfo}
+
+This is a scalar, the raw data of the AppInfo block.
+
+=head2 Sort block
+
+    $pdb->{sort}
+
+This is a scalar, the raw data of the sort block.
+
+=head2 Records
+
+    @{$pdb->{records}};
+
+Each element in the "records" array is a reference-to-hash. In
+addition to the standard keys ("attributes", "category", and "id"),
+this hash contains the key "data"; its value is a string with the raw
+record data.
+
+=head2 Resources
+
+    @{$pdb->{resources}};
+
+Each element in the "resources" array is a reference-to-hash. In
+addition to the standard keys ("type" and "id"), it contains the key
+"data"; its value is a string with the raw resource data.
+
+=cut
+#'
+
+sub import
+{
+	# This package handles any PDB.
+	&Palm::PDB::RegisterPDBHandlers(__PACKAGE__,
+		[ "", "" ]
+		);
+}
+
+# sub new
+# sub new_Record
+# These are just inherited.
+
+sub ParseAppInfoBlock
+{
+	my $self = shift;
+	my $data = shift;
+
+	return $data;
+}
+
+sub ParseSortBlock
+{
+	my $self = shift;
+	my $data = shift;
+
+	return $data;
+}
+
+sub ParseRecord
+{
+	my $self = shift;
+	my %record = @_;
+
+	return \%record;
+}
+
+sub ParseResource
+{
+	my $self = shift;
+	my %resource = @_;
+
+	return \%resource;
+}
+
+sub PackAppInfoBlock
+{
+	my $self = shift;
+
+	return $self->{appinfo};
+}
+
+sub PackSortBlock
+{
+	my $self = shift;
+
+	return $self->{sort};
+}
+
+sub PackRecord
+{
+	my $self = shift;
+	my $record = shift;
+
+	return $record->{data};
+}
+
+sub PackResource
+{
+	my $self = shift;
+	my $resource = shift;
+
+	return $resource->{data};
+}
+
+=head1 SOURCE CONTROL
+
+The source is in Github:
+
+	http://github.com/briandfoy/p5-Palm/tree/master
+	
+=head1 AUTHOR
+
+Alessandro Zummo, C<< <a.zummo@towertech.it> >>
+
+Currently maintained by brian d foy, C<< <bdfoy@cpan.org> >>
+
+=head1 SEE ALSO
+
+Palm::PDB(3)
+
+=cut
+
+}
+
+
+package Palm::Doc; BEGIN { $INC{"Palm/Doc.pm"} = "Palm/Doc.pm" }
+BEGIN {
+# Palm::Doc.pm
+#
+# Palm::PDB helper for handling Palm Doc databases
+#
+# Copyright (C) 2004 Christophe Beauregard
+#
+# $Id: Doc.pm,v 1.19 2005/05/12 01:36:49 cpb Exp $
+
+use strict;
+
+package Palm::Doc;
+
+use Palm::PDB;
+use Palm::Raw();
+use vars qw( $VERSION @ISA );
+
+$VERSION = do { my @r = (q$Revision: 1.19 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r };
+
+@ISA = qw( Palm::Raw );
+
+use constant DOC_UNCOMPRESSED => scalar 1;
+use constant DOC_COMPRESSED => scalar 2;
+use constant DOC_RECSIZE => scalar 4096;
+
+=head1 NAME
+
+Palm::Doc - Handler for Palm Doc books
+
+=head1 SYNOPSIS
+
+use Palm::Doc;
+
+=head1 DESCRIPTION
+
+Helper for reading and writing Palm Doc books. The interface is based on
+L<Palm::ZText> since it just makes sense. However, because of the nature
+of these databases, record-level processing is just a Bad Idea. Use
+the C<text> and C<textfile> calls rather than do direct access of the
+C<@records> array.
+
+=head1 EXAMPLES
+
+Convert a text file to a .pdb:
+
+	use Palm::Doc;
+	my $doc = new Palm::Doc;
+	$doc->textfile( $ARGV[0] );
+	$doc->Write( $ARGV[0] . ".pdb" );
+
+Convert an HTML file to a .prc:
+
+	use HTML::TreeBuilder;
+	use HTML::FormatText;
+	use Palm::Doc;
+
+	my $tree = HTML::TreeBuilder->new_from_file( $ARGV[0] );
+	my $formatter = HTML::FormatText->new( leftmargin => 0, rightmargin => 80 );
+	my $doc = new Palm::Doc;
+	$doc->{attributes}{resource} = 1;
+	$doc->text( $formatter->format( $tree ) );
+	$doc->Write( $ARGV[0] . ".prc" );
+
+=cut
+#'
+
+sub import
+{
+	&Palm::PDB::RegisterPDBHandlers( __PACKAGE__, [ "REAd", "TEXt" ], );
+	&Palm::PDB::RegisterPRCHandlers( __PACKAGE__, [ "REAd", "TEXt" ], );
+	&Palm::PDB::RegisterPDBHandlers( __PACKAGE__, [ "MOBI", "BOOK" ], );
+	&Palm::PDB::RegisterPRCHandlers( __PACKAGE__, [ "MOBI", "BOOK" ], );
+}
+
+=head2 new
+
+	$doc = new Palm::Doc;
+
+Create a new Doc object. By default, it's not a resource database. Setting
+C<$self->{attributes}{resource}> to C<1> before any manipulations will
+cause it to become a resource database.
+
+=cut
+
+sub new
+{
+	my $class = shift;
+	my $self = $class->SUPER::new(@_);
+
+	$self->{'creator'} = 'REAd';
+	$self->{'type'} = 'TEXt';
+
+	$self->{attributes}{resource} = 0;
+
+	$self->{appinfo} = undef;
+	$self->{sort} = undef;
+	$self->{records} = [];
+
+	return $self;
+}
+
+# determine if the given (raw) record is a Doc header record and fill in the
+# record with appropriate fields if it is.
+sub OLD_parse_headerrec($) {
+	my $record = shift;
+	return undef unless exists $record->{'data'};
+
+	# Doc header is minimum of 16 bytes
+	return undef if length $record->{'data'} < 16;
+
+	my ($version,$spare,$ulen, $records, $recsize, $position)
+		= unpack( 'n n N n n N', $record->{'data'} );
+
+	my $h = sprintf ("%x", $version);
+	print STDERR "Version: $version - $h - ";
+	if ($version == DOC_COMPRESSED) {
+	    print STDERR " DOC_COMPRESSED\n";
+	}
+	if ($version == DOC_UNCOMPRESSED) {
+	    print STDERR " DOC_UNCOMPRESSED\n";
+	}
+	if ($version != DOC_UNCOMPRESSED and $version != DOC_COMPRESSED) {
+	    print STDERR " probably HUFFDIC_COMPRESSED - CANNOT BE DECOMPRESSED!!!\n";
+	}
+
+	# the header is followed by a list of record sizes. We don't use
+	# this since we can guess the sizes pretty easily by looking at
+	# the actual records.
+
+	# According to the spec, $version is either 1 (uncompressed)
+	# or 2 (compress), while spare is always zero. AportisDoc supposedly sets
+	# spare to something else, so screw AportisDoc.
+	return undef if $version != DOC_UNCOMPRESSED and $version != DOC_COMPRESSED;
+	return undef if $spare != 0;
+
+	$record->{'version'} = $version;
+	$record->{'length'} = $ulen;
+	$record->{'records'} = $records;
+	$record->{'recsize'} = $recsize;
+	$record->{'position'} = $position;
+
+	return $record;
+}
+
+sub _parse_headerrec($) {
+	my $record = shift;
+	return undef unless exists $record->{'data'};
+
+	# Doc header is minimum of 16 bytes
+	return undef if length $record->{'data'} < 16;
+
+
+	my ($version,$spare,$ulen, $records, $recsize, $position)
+		= unpack( 'n n N n n N', $record->{'data'} );
+
+	# the header is followed by a list of record sizes. We don't use
+	# this since we can guess the sizes pretty easily by looking at
+	# the actual records.
+
+	# According to the spec, $version is either 1 (uncompressed)
+	# or 2 (compress), while spare is always zero. AportisDoc supposedly sets
+	# spare to something else, so screw AportisDoc.
+
+    #
+    # $version is 17480 for DRM:ed MobiPocket books
+    #
+    # So comment away the check
+   ###	return undef if $version != DOC_UNCOMPRESSED and $version != DOC_COMPRESSED;
+
+	return undef if $spare != 0;
+
+	$record->{'version'} = $version;
+	$record->{'length'} = $ulen;
+	$record->{'records'} = $records;
+	$record->{'recsize'} = $recsize;
+	$record->{'position'} = $position;
+
+	return $record;
+}
+
+sub _compress_record($$) {
+	my ($version,$in) = @_;
+	return $in if $version == DOC_UNCOMPRESSED;
+
+	my $out = '';
+
+	my $lin = length $in;
+	my $i = 0;
+	while( $i < $lin ) {
+		# See http://patb.dyndns.org/Programming/PilotDoc.htm for the code type
+		# taxonomy.
+
+		# Try type B compression first.
+		# If the next 3 to 10 bytes are already in the compressed buffer, we can
+		# encode them into a 2 byte sequence. Don't bother too close to the ends,
+		# however... Makes the boundary conditions simpler.
+		if( $i > 10 and $lin - $i > 10 ) {
+			my $chunk = '';
+			my $match = -1;
+
+			# the preamble is what'll be in the decoders output buffer.
+			my $preamble = substr( $in, 0, $i );
+			for( my $j = 10; $j >= 3; $j -- ) {
+				$chunk = substr( $in, $i, $j );	# grab next $j characters
+				$match = rindex( $preamble, $chunk );	# in the output?
+
+				# type B code has a 2047 byte sliding window, so matches have to be
+				# within that range to be useful
+				last if $match >= 0 and ($i - $match) <= 2047;
+				$match = -1;
+			}
+
+			my $n = length $chunk;
+			if( $match >= 0 and $n <= 10 and $n >= 3 ) {
+				my $m = $i - $match;
+
+				# first 2 bits are 10, next 11 are offset, next 3 are length-3
+				$out .= pack( "n", 0x8000 + (($m<<3)&0x3ff8) + ($n-3) );
+
+				$i += $n;
+
+				next;
+			}
+		}
+		
+		my $ch = substr( $in, $i ++, 1 );
+		my $och = ord($ch);
+
+		# Try type C compression.
+		if( $i+1 < $lin and $ch eq ' ' ) {
+			my $nch = substr( $in, $i, 1 );
+			my $onch = ord($nch);
+
+			if( $onch >= 0x40 and $onch < 0x80 ) {
+				# space plus ASCII character compression
+				$out .= chr($onch ^ 0x80);
+				$i ++;
+
+				next;
+			}
+		} 
+
+		if( $och == 0 or ($och >= 9 and $och < 0x80) ) {
+			# pass through
+			$out .= $ch;
+		} else {
+			# type A code. This is essentially an 'escape' like '\\' in strings.
+			# For efficiency, it's best to encode as long a sequence as
+			# possible with one copy. This might seem like it would cause us to miss
+			# out on a type B sequence, but in actuality keeping long binary strings
+			# together improves the likelyhood of a later type B sequence than 
+			# interspersing them with x01's.
+
+			my $next = substr($in,$i - 1);
+			if( $next =~ /([\x01-\x08\x80-\xff]{1,8})/o ) {
+				my $binseq = $1;
+				$out .= chr(length $binseq);
+				$out .= $binseq;
+				$i += length( $binseq ) - 1;	# first char, $ch, is already counted
+			}
+		}
+	}
+
+	return $out;
+}
+
+# algorithm taken from makedoc7.cpp with reference to
+# http://patb.dyndns.org/Programming/PilotDoc.htm and
+# http://www.pyrite.org/doc_format.html
+sub _decompress_record($$) {
+	my ($version,$in) = @_;
+	return $in if $version == DOC_UNCOMPRESSED;
+
+	my $out = '';
+
+	my $lin = length $in;
+	my $i = 0;
+	while( $i < $lin ) {
+		my $ch = substr( $in, $i ++, 1 );
+		my $och = ord($ch);
+
+		if( $och >= 1 and $och <= 8 ) {
+			# copy this many bytes... basically a way to 'escape' data
+			$out .= substr( $in, $i, $och );
+			$i += $och;
+		} elsif( $och < 0x80 ) {
+			# pass through 0, 9-0x7f
+			$out .= $ch;
+		} elsif( $och >= 0xc0 ) {
+			# 0xc0-0xff are 'space' plus ASCII char
+			$out .= ' ';
+			$out .= chr($och ^ 0x80);
+		} else {
+			# 0x80-0xbf is sequence from already decompressed buffer
+			my $nch = substr( $in, $i ++, 1 );
+			$och = ($och << 8) + ord($nch);
+			my $m = ($och & 0x3fff) >> 3;
+			my $n = ($och & 0x7) + 3;
+
+			# This isn't very perl-like, but a simple
+			# substr($out,$lo-$m,$n) doesn't work.
+			my $lo = length $out;
+			for( my $j = 0; $j < $n; $j ++, $lo ++ ) {
+				die "bad Doc compression" unless ($lo-$m) >= 0;
+				$out .= substr( $out, $lo-$m, 1 );
+			}
+		}
+	}
+
+	return $out;
+}
+
+sub Write {
+	my $self = shift;
+
+	my $prc = $self->{attributes}{resource};
+	my $recs = $prc ? $self->{'resources'} : $self->{'records'};
+	my $header = $recs->[0];
+	unless( defined _parse_headerrec($header) ) {
+		die "@_: Doesn't appear to be a correct book...";
+	}
+
+	$self->SUPER::Write(@_);
+}
+
+=head2 text
+
+	$text = $doc->text;
+
+Return the contents of the Doc database.
+
+	$text = $doc->text( @text );
+
+Set the contents of the Doc book to the specified arguments. All the list arguments
+will simply be concatenated together.
+
+=cut
+
+sub text {
+	my $self = shift;
+
+	my $body = '';
+	my $prc = $self->{attributes}{resource};
+
+	if( @_ > 0 ) {
+		$body = join( '', @_ );
+
+		my $version = DOC_COMPRESSED;
+
+		$self->{'records'} = [];
+		$self->{'resources'} = [];
+
+		# first record is the header
+		my $header = $prc ? $self->append_Resource() : $self->append_Record();
+		$header->{'version'} = $version;
+		$header->{'length'} = 0;
+		$header->{'records'} = 0;
+		$header->{'recsize'} = DOC_RECSIZE;
+
+		# break the document into record-sized chunks
+		for( my $i = 0; $i < length($body); $i += DOC_RECSIZE ) {
+			my $record = $prc ? $self->append_Resource : $self->append_Record;
+			my $chunk = substr($body,$i,DOC_RECSIZE);
+			$record->{'data'} = _compress_record( $version, $chunk );
+
+			$header->{'records'} ++;
+			$header->{'length'} += length $body;
+		}
+
+		$header->{'recsize'} = $header->{'length'}
+			if $header->{'length'} < DOC_RECSIZE;
+
+		# pack up the header
+		$header->{'data'} = pack( 'n xx N n n N',
+			$header->{'version'}, $header->{'length'},
+			$header->{'records'}, $header->{'recsize'}, 0 );
+
+	} elsif( defined wantarray ) {
+
+	    my $recs = $prc ? $self->{'resources'} : $self->{'records'};
+
+	    my $header = $recs->[0];
+	    if( defined _parse_headerrec($header) ) {
+		# a proper Doc file should be fine, but if it's not Doc
+		# compression like some Mobi docs seem to be we want to
+		# bail early. Otherwise we end up with a huge stream of
+		# substr() errors and we _still_ don't get any content.
+		eval {
+		    sub min { return ($_[0]<$_[1]) ? $_[0] : $_[1] }
+		    my $maxi = min($#$recs, $header->{'records'});
+		    for( my $i = 1; $i <= $maxi; $i ++ ) {
+			my $data = $recs->[$i]->{'data'};
+			my $len = length($data);
+			my $overlap = "";
+			if ($self->{multibyteoverlap}) {
+			    my $c = chop $data;
+			    print STDERR "I:$i - $len - ", int($c), "\n";
+			    my $n = $c & 7;
+			    foreach (0..$n-1) {
+				$overlap = (chop $data) . $overlap;
+			    }
+			}
+			
+			$body .= _decompress_record( $header->{'version'},
+						     $data );
+			$body .= $overlap;
+		    }
+		};
+		return undef if $@;
+	    }
+	}
+
+	return $body;
+}
+
+=head2 textfile
+
+	$doc->textfile( "README.txt" );
+
+Set the contents of the Doc to the contents of the file and sets the name of the PDB to
+the specified filename.
+
+=cut
+
+sub textfile($$) {
+	my ($self, $filename) = @_;
+
+	open IN, "< $filename" or return undef;
+	binmode IN;
+	$self->text( '', <IN> );
+	close IN;
+
+	$self->{'name'} = $filename;
+}
+
+=head1 BUGS
+
+Bookmarks are unsupported. I've never had any use for them.
+
+Output databases are always compressed and there's no option to
+disable compression.  I consider this a feature, to be honest.
+
+=head2 Note On Character Sets
+
+L<Palm::Doc> doesn't do anything with character sets. This might be a bug,
+depending on how you feel about this kind of thing, but the reality is that
+we're generally converting between text and Doc files, neither of which are
+real great at telling us what encoding we're supposed to use.
+
+My understanding of PalmOS character sets is that Doc books should be
+encoded in either Windows Code Page 1252 or, for Japanese, 932. Actually,
+the PalmOS encoding is a small variation on those. In practice, ISO 8859-1
+works okay for western languages which is real nice because L<Encode>
+doesn't know about the PalmOS stuff. 
+
+This gist of all this is that when you're creating a L<Palm::Doc>, you may
+need to do something along the lines of:
+
+	use Encode 'from_to';
+
+	my $text = read_my_text();
+	from_to( $text, $charset, 'iso-8859-1' ) unless $charset =~ /8859-1$/;
+	my $doc = new Palm::Doc();
+	$doc->text( $text );
+
+And when you're reading a L<Palm::Doc> and you care about the character
+set, you're pretty much going to have to guess the encoding and act
+appropriately:
+
+	use Encode 'decode';
+	my $doc = new Palm::PDB;
+	$doc->Load( $pdbname );
+	my $text = decode("iso-8859-1", $doc->text());
+
+=head1 AUTHOR
+
+Christophe Beauregard E<lt>cpb@cpan.orgE<gt>
+
+=head1 SEE ALSO
+
+L<Palm::PDB>
+
+L<Palm::ZText>
+
+makedoc
+
+L<http://www.pyrite.org/doc_format.html>
+
+L<http://patb.dyndns.org/Programming/PilotDoc.htm>
+
+L<Palm::PalmDoc> is another CPAN module for handling Doc databases,
+but doesn't use L<Palm::PDB> and doesn't handle reading Docs.
+
+L<http://www.df.lth.se/~triad/krad/recode/palm.html> for details on PalmOS
+text encoding
+
+=cut
+
+}
+
+package Getopt::Mixed; BEGIN { $INC{"Getopt/Mixed.pm"} = "Getopt/Mixed.pm" }
+BEGIN {
+#---------------------------------------------------------------------
+#package Getopt::Mixed;
+#
+# Copyright 1995 Christopher J. Madsen
+#
+# Author: Christopher J. Madsen <perl@cjmweb.net>
+# Created: 1 Jan 1995
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the same terms as Perl itself.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See either the
+# GNU General Public License or the Artistic License for more details.
+#
+# ABSTRACT: getopt processing with both long and short options
+#---------------------------------------------------------------------
+
+require 5.000;
+use strict;
+use Carp;
+
+use vars qw(
+    @EXPORT @EXPORT_OK @ISA %options
+    $PERMUTE $REQUIRE_ORDER $RETURN_IN_ORDER $VERSION
+    $badOption $checkArg $checkType $floatRegexp $group $ignoreCase
+    $intRegexp $option $optionEnd $optionStart $order $typeChars
+);
+
+require Exporter;
+@ISA = qw(Exporter);
+@EXPORT = ();
+@EXPORT_OK = qw(abortMsg getOptions nextOption);
+
+#=====================================================================
+# Package Global Variables:
+
+BEGIN
+{
+    $VERSION = '1.11';
+
+    # The permissible settings for $order:
+    $REQUIRE_ORDER   = 0;
+    $PERMUTE         = 1;
+    $RETURN_IN_ORDER = 2;
+
+    # Regular expressions:
+    $intRegexp   = '^[-+]?\d+$';               # Match an integer
+    $floatRegexp = '^[-+]?(\d*\.?\d+|\d+\.)$'; # Match a real number
+    $typeChars   = 'sif';                      # Match type characters
+} # end BEGIN
+
+#=====================================================================
+# Subroutines:
+#---------------------------------------------------------------------
+# Initialize the option processor:
+#
+# You should set any customization variables *after* calling init.
+#
+# For a description of option declarations, see the documentation at
+# the end of this file.
+#
+# Input:
+#   List of option declarations (separated by whitespace)
+#     If the first argument is entirely non-alphanumeric characters
+#     with no whitespace, it is the characters that start options.
+
+sub init
+{
+    undef %options;
+    my($opt,$type);
+
+    $ignoreCase  = 1;           # Ignore case by default
+    $optionStart = "-";         # Dash is the default option starter
+
+    # If the first argument is entirely non-alphanumeric characters
+    # with no whitespace, it is the desired value for $optionStart:
+    $optionStart = shift @_ if $_[0] =~ /^[^a-z0-9\s]+$/i;
+
+    foreach $group (@_) {
+        # Ignore case unless there are upper-case options:
+        $ignoreCase = 0 if $group =~ /[A-Z]/;
+        foreach $option (split(/\s+/,$group)) {
+            croak "Invalid option declaration `$option'"
+                unless $option =~ /^([^=:>]+)([=:][$typeChars]|>[^=:>]+)?$/o;
+            $opt  = $1;
+            $type = $2 || "";
+            if ($type =~ /^>(.*)$/) {
+                $type = $1;
+                croak "Invalid synonym `$option'"
+                    if (not defined $options{$type}
+                        or $options{$type} =~ /^[^:=]/);
+            } # end if synonym
+            $options{$opt} = $type;
+        } # end foreach option
+    } # end foreach group
+
+    # Handle POSIX compliancy:
+    if (defined $ENV{"POSIXLY_CORRECT"}) {
+        $order = $REQUIRE_ORDER;
+    } else {
+        $order = $PERMUTE;
+    }
+
+    $optionEnd = 0;
+    $badOption = \&badOption;
+    $checkArg  = \&checkArg;
+} # end init
+
+#---------------------------------------------------------------------
+# Clean up when we're done:
+#
+# This just releases the memory used by the %options hash.
+#
+# If 'help' was defined as an option, a new hash with just 'help' is
+# created, in case the program calls abortMsg.
+
+sub cleanup
+{
+    my $help = defined($options{'help'});
+    undef %options;
+    $options{'help'} = "" if $help;
+} # end cleanup
+
+#---------------------------------------------------------------------
+# Abort program with message:
+#
+# Prints program name and arguments to STDERR
+# If --help is an option, prints message saying 'Try --help'
+# Exits with code 1
+
+sub abortMsg
+{
+    my $name = $0;
+    $name =~ s|^.+[\\/]||;      # Remove any directories from name
+    print STDERR $name,": ",@_,"\n";
+    print STDERR "Try `$name --help' for more information.\n"
+        if defined $options{"help"};
+    exit 1;
+} # end abortMsg
+
+#---------------------------------------------------------------------
+# Standard function for handling bad options:
+#
+# Prints an error message and exits.
+#
+# You can override this by setting $Getopt::Mixed::badOption to a
+# function reference.
+#
+# Input:
+#   Index into @ARGV
+#   The option that caused the error
+#   An optional string describing the problem
+#     Currently, this can be
+#       undef        The option was not recognized
+#       'ambiguous'  The option could match several long options
+#
+# Note:
+#   The option has already been removed from @ARGV.  To put it back,
+#   you can say:
+#     splice(@ARGV,$_[0],0,$_[1]);
+#
+#   If your function returns, it should return whatever you want
+#   nextOption to return.
+
+sub badOption
+{
+    my ($index, $option, $problem) = @_;
+
+    $problem = 'unrecognized' unless $problem;
+
+    abortMsg("$problem option `$option'");
+} # end badOption
+
+#---------------------------------------------------------------------
+# Make sure we have the proper argument for this option:
+#
+# You can override this by setting $Getopt::Mixed::checkArg to a
+# function reference.
+#
+# Input:
+#   $i:       Position of argument in @ARGV
+#   $value:   The text appended to the option (undef if no text)
+#   $option:  The pretty name of the option (as the user typed it)
+#   $type:    The type of the option
+#
+# Returns:
+#   The value of the option's argument
+
+sub checkArg
+{
+    my ($i,$value,$option,$type) = @_;
+
+    abortMsg("option `$option' does not take an argument")
+        if (not $type and defined $value);
+
+    if ($type =~ /^=/) {
+        # An argument is required for this option:
+        $value = splice(@ARGV,$i,1) unless defined $value;
+        abortMsg("option `$option' requires an argument")
+            unless defined $value;
+    }
+
+    if ($type =~ /i$/) {
+        abortMsg("option `$option' requires integer argument")
+            if (defined $value and $value !~ /$intRegexp/o);
+    }
+    elsif ($type =~ /f$/) {
+        abortMsg("option `$option' requires numeric argument")
+            if (defined $value and $value !~ /$floatRegexp/o);
+    }
+    elsif ($type =~ /^[=:]/ and ref($checkType)) {
+        $value = &$checkType($i,$value,$option,$type);
+    }
+
+    $value = "" if not defined $value and $type =~ /^:/;
+
+    $value;
+} # end checkArg
+
+#---------------------------------------------------------------------
+# Find a match for an incomplete long option:
+#
+# Input:
+#   The option text to match
+#
+# Returns:
+#   The option that matched, or
+#   undef, if no option matched, or
+#   (undef, 'ambiguous'), if multiple options matched
+
+sub findMatch
+{
+    my $opt = shift;
+
+    $opt =~ s/-/[^-]*-/g;
+    $opt .= ".*";
+
+    my @matches = grep(/^$opt$/, keys %options);
+
+    return undef       if $#matches <  0;
+    return $matches[0] if $#matches == 0;
+
+    $opt = $matches[0];
+    $opt = $options{$opt} if $options{$opt} =~ /^[^=:]/;
+
+    foreach (@matches) {
+        return (undef, 'ambiguous')
+            unless $_ eq $opt or $options{$_} eq $opt;
+    }
+
+    $opt;
+} # end findMatch
+
+#---------------------------------------------------------------------
+# Return the next option:
+#
+# Returns a list of 3 elements:  (OPTION, VALUE, PRETTYNAME), where
+#   OPTION is the name of the option,
+#   VALUE is its argument, and
+#   PRETTYNAME is the option as the user entered it.
+# Returns the null list if there are no more options to process
+#
+# If $order is $RETURN_IN_ORDER, and this is a normal argument (not an
+# option), OPTION will be the null string, VALUE will be the argument,
+# and PRETTYNAME will be undefined.
+
+sub nextOption
+{
+    return () if $#ARGV < 0;    # No more arguments
+
+    if ($optionEnd) {
+        # We aren't processing any more options:
+        return ("", shift @ARGV) if $order == $RETURN_IN_ORDER;
+        return ();
+    }
+
+    # Find the next option:
+    my $i = 0;
+    while (length($ARGV[$i]) < 2 or
+           index($optionStart,substr($ARGV[$i],0,1)) < 0) {
+        return ()                if $order == $REQUIRE_ORDER;
+        return ("", shift @ARGV) if $order == $RETURN_IN_ORDER;
+        ++$i;
+        return () if $i > $#ARGV;
+    } # end while
+
+    # Process the option:
+    my($option,$opt,$value,$optType,$prettyOpt);
+    $option = $ARGV[$i];
+    if (substr($option,0,1) eq substr($option,1,1)) {
+        # If the option start character is repeated, it's a long option:
+        splice @ARGV,$i,1;
+        if (length($option) == 2) {
+            # A double dash by itself marks the end of the options:
+            $optionEnd = 1;     # Don't process any more options
+            return nextOption();
+        } # end if bare double dash
+        $opt = substr($option,2);
+        if ($opt =~ /^([^=]+)=(.*)$/) {
+            $opt = $1;
+            $value = $2;
+        } # end if option is followed by value
+        $opt =~ tr/A-Z/a-z/ if $ignoreCase;
+        $prettyOpt = substr($option,0,2) . $opt;
+        my $problem;
+        ($opt, $problem) = findMatch($opt)
+            unless defined $options{$opt} and length($opt) > 1;
+        return &$badOption($i,$option,$problem) unless $opt;
+        $optType = $options{$opt};
+        if ($optType =~ /^[^:=]/) {
+            $opt = $optType;
+            $optType = $options{$opt};
+        }
+        $value = &$checkArg($i,$value,$prettyOpt,$optType);
+    } # end if long option
+    else {
+        # It's a short option:
+        $opt = substr($option,1,1);
+        $opt =~ tr/A-Z/a-z/ if $ignoreCase;
+        return &$badOption($i,$option) unless defined $options{$opt};
+        $optType = $options{$opt};
+        if ($optType =~ /^[^:=]/) {
+            $opt = $optType;
+            $optType = $options{$opt};
+        }
+        if (length($option) == 2 or $optType) {
+            # This is the last option in the group, so remove the group:
+            splice(@ARGV,$i,1);
+        } else {
+            # Just remove this option from the group:
+            substr($ARGV[$i],1,1) = "";
+        }
+        if ($optType) {
+            $value = (length($option) > 2) ? substr($option,2) : undef;
+            $value =~ s/^=// if $value; # Allow either -d3 or -d=3
+        } # end if option takes an argument
+        $prettyOpt = substr($option,0,2);
+        $value = &$checkArg($i,$value,$prettyOpt,$optType);
+    } # end else short option
+    ($opt,$value,$prettyOpt);
+} # end nextOption
+
+#---------------------------------------------------------------------
+# Get options:
+#
+# Input:
+#   The same as for init()
+#   If no parameters are supplied, init() is NOT called.  This allows
+#   you to call init() yourself and then change the configuration
+#   variables.
+#
+# Output Variables:
+#   Sets $opt_X for each `-X' option encountered.
+#
+#   Note that if --apple is a synonym for -a, then --apple will cause
+#   $opt_a to be set, not $opt_apple.
+
+sub getOptions
+{
+    &init if $#_ >= 0;        # Pass arguments (if any) on to init
+
+    # If you want to use $RETURN_IN_ORDER, you have to call
+    # nextOption yourself; getOptions doesn't support it:
+    $order = $PERMUTE if $order == $RETURN_IN_ORDER;
+
+    my ($option,$value,$package);
+
+    $package = (caller)[0];
+
+    while (($option, $value) = nextOption()) {
+        $option =~ s/\W/_/g;    # Make a legal Perl identifier
+        $value = 1 unless defined $value;
+        my $code = "\$" . $package . "::opt_$option = \$value;";
+        $code =~ /(.+)/;        # Untaint it
+        eval $1;
+    } # end while
+
+    cleanup();
+} # end getOptions
+
+#=====================================================================
+# Package return value:
+
+=head1 NAME
+
+Getopt::Mixed - getopt processing with both long and short options
+
+=head1 VERSION
+
+This document describes version 1.11 of
+Getopt::Mixed, released August 25, 2012.
+
+=head1 SYNOPSIS
+
+    use Getopt::Mixed;
+    Getopt::Mixed::getOptions(...option-descriptions...);
+    ...examine $opt_* variables...
+
+or
+
+    use Getopt::Mixed "nextOption";
+    Getopt::Mixed::init(...option-descriptions...);
+    while (($option, $value) = nextOption()) {
+        ...process option...
+    }
+    Getopt::Mixed::cleanup();
+
+=head1 DESCRIPTION
+
+This module is obsolete.
+
+This package was my response to the standard modules Getopt::Std and
+Getopt::Long.  C<Std> doesn't support long options, and C<Long>
+didn't support short options.  I wanted both, since long options are
+easier to remember and short options are faster to type.
+
+However, some time ago Getopt::Long was changed to support short
+options as well, and it has the huge advantage of being part of the
+standard Perl distribution.  So, Getopt::Mixed is now effectively
+obsolete.  I don't intend to make any more changes, but I'm leaving it
+available for people who have code that already uses it.  For new
+modules, I recommend using Getopt::Long like this:
+
+    use Getopt::Long;
+    Getopt::Long::Configure(qw(bundling no_getopt_compat));
+    GetOptions(...option-descriptions...);
+
+This package was intended to be the "Getopt-to-end-all-Getop's".  It
+combines (I hope) flexibility and simplicity.  It supports both short
+options (introduced by C<->) and long options (introduced by C<-->).
+Short options which do not take an argument can be grouped together.
+Short options which do take an argument must be the last option in
+their group, because everything following the option will be
+considered to be its argument.
+
+There are two methods for using Getopt::Mixed:  the simple method and
+the flexible method.  Both methods use the same format for option
+descriptions.
+
+=head2 Option Descriptions
+
+The option-description arguments required by C<init> and C<getOptions>
+are strings composed of individual option descriptions.  Several
+option descriptions can appear in the same string if they are
+separated by whitespace.
+
+Each description consists of the option name and an optional trailing
+argument specifier.  Option names may consist of any characters but
+whitespace, C<=>, C<:>, and C<E<gt>>.
+
+Values for argument specifiers are:
+
+  <none>   option does not take an argument
+  =s :s    option takes a mandatory (=) or optional (:) string argument
+  =i :i    option takes a mandatory (=) or optional (:) integer argument
+  =f :f    option takes a mandatory (=) or optional (:) real number argument
+  >new     option is a synonym for option `new'
+
+The C<E<gt>> specifier is not really an argument specifier.  It
+defines an option as being a synonym for another option.  For example,
+"a=i apples>a" would define B<-a> as an option that requires an
+integer argument and B<--apples> as a synonym for B<-a>.  Only one
+level of synonyms is supported, and the root option must be listed
+first.  For example, "apples>a a=i" and "a=i apples>a oranges>apples"
+are illegal; use "a=i apples>a oranges>a" if that's what you want.
+
+For example, in the option description:
+     "a b=i c:s apple baker>b charlie:s"
+         -a and --apple do not take arguments
+         -b takes a mandatory integer argument
+         --baker is a synonym for -b
+         -c and --charlie take an optional string argument
+
+If the first argument to C<init> or C<getOptions> is entirely
+non-alphanumeric characters with no whitespace, it represents the
+characters which can begin options.
+
+=head2 User Interface
+
+From the user's perspective, short options are introduced by a dash
+(C<->) and long options are introduced by a double dash (C<-->).
+Short options may be combined ("-a -b" can be written "-ab"), but an
+option that takes an argument must be the last one in its group,
+because anything following it is considered part of the argument.  A
+double dash by itself marks the end of the options; all arguments
+following it are treated as normal arguments, not options.  A single
+dash by itself is treated as a normal argument, I<not> an option.
+
+Long options may be abbreviated.  An option B<--all-the-time> could be
+abbreviated B<--all>, B<--a--tim>, or even B<--a>.  Note that B<--time>
+would not work; the abbreviation must start at the beginning of the
+option name.  If an abbreviation is ambiguous, an error message will
+be printed.
+
+In the following examples, B<-i> and B<--int> take integer arguments,
+B<-f> and B<--float> take floating point arguments, and B<-s> and
+B<--string> take string arguments.  All other options do not take an
+argument.
+
+  -i24            -f24.5               -sHello
+  -i=24 --int=-27 -f=24.5 --float=0.27 -s=Hello --string=Hello
+
+If the argument is required, it can also be separated by whitespace:
+
+  -i 24 --int -27 -f 24.5 --float 0.27 -s Hello --string Hello
+
+Note that if the option is followed by C<=>, whatever follows the C<=>
+I<is> the argument, even if it's the null string.  In the example
+
+  -i= 24 -f= 24.5 -s= Hello
+
+B<-i> and B<-f> will cause an error, because the null string is not a
+number, but B<-s> is perfectly legal; its argument is the null string,
+not "Hello".
+
+Remember that optional arguments I<cannot> be separated from the
+option by whitespace.
+
+=head2 The Simple Method
+
+The simple method is
+
+    use Getopt::Mixed;
+    Getopt::Mixed::getOptions(...option-descriptions...);
+
+You then examine the C<$opt_*> variables to find out what options were
+specified and the C<@ARGV> array to see what arguments are left.
+
+If B<-a> is an option that doesn't take an argument, then C<$opt_a>
+will be set to 1 if the option is present, or left undefined if the
+option is not present.
+
+If B<-b> is an option that takes an argument, then C<$opt_b> will be
+set to the value of the argument if the option is present, or left
+undefined if the option is not present.  If the argument is optional
+but not supplied, C<$opt_b> will be set to the null string.
+
+Note that even if you specify that an option I<requires> a string
+argument, you can still get the null string (if the user specifically
+enters it).  If the option requires a numeric argument, you will never
+get the null string (because it isn't a number).
+
+When converting the option name to a Perl identifier, any non-word
+characters in the name will be converted to underscores (C<_>).
+
+If the same option occurs more than once, only the last occurrence
+will be recorded.  If that's not acceptable, you'll have to use the
+flexible method instead.
+
+=head2 The Flexible Method
+
+The flexible method is
+
+    use Getopt::Mixed "nextOption";
+    Getopt::Mixed::init(...option-descriptions...);
+    while (($option, $value, $pretty) = nextOption()) {
+        ...process option...
+    }
+    Getopt::Mixed::cleanup();
+
+This lets you process arguments one at a time.  You can then handle
+repeated options any way you want to.  It also lets you see option
+names with non-alphanumeric characters without any translation.  This
+is also the only method that lets you find out what order the options
+and other arguments were in.
+
+First, you call Getopt::Mixed::init with the option descriptions.
+Then, you keep calling nextOption until it returns an empty list.
+Finally, you call Getopt::Mixed::cleanup when you're done.  The
+remaining (non-option) arguments will be found in C<@ARGV>.
+
+Each call to nextOption returns a list of the next option, its value,
+and the option as the user typed it.  The value will be undefined if
+the option does not take an argument.  The option is stripped of its
+starter (e.g., you get "a" and "foo", not "-a" or "--foo").  If you
+want to print an error message, use the third element, which does
+include the option starter.
+
+=head1 OTHER FUNCTIONS
+
+Getopt::Mixed provides one other function you can use.  C<abortMsg>
+prints its arguments on STDERR, plus your program's name and a
+newline.  It then exits with status 1.  For example, if F<foo.pl>
+calls C<abortMsg> like this:
+
+  Getopt::Mixed::abortMsg("Error");
+
+The output will be:
+
+  foo.pl: Error
+
+=head1 CUSTOMIZATION
+
+There are several customization variables you can set.  All of these
+variables should be set I<after> calling Getopt::Mixed::init and
+I<before> calling nextOption.
+
+If you set any of these variables, you I<must> check the version
+number first.  The easiest way to do this is like this:
+
+    use Getopt::Mixed 1.006;
+
+If you are using the simple method, and you want to set these
+variables, you'll need to call init before calling getOptions, like
+this:
+
+    use Getopt::Mixed 1.006;
+    Getopt::Mixed::init(...option-descriptions...);
+    ...set configuration variables...
+    Getopt::Mixed::getOptions();      # IMPORTANT: no parameters
+
+=over 4
+
+=item $order
+
+$order can be set to $REQUIRE_ORDER, $PERMUTE, or $RETURN_IN_ORDER.
+The default is $REQUIRE_ORDER if the environment variable
+POSIXLY_CORRECT has been set, $PERMUTE otherwise.
+
+$REQUIRE_ORDER means that no options can follow the first argument
+which isn't an option.
+
+$PERMUTE means that all options are treated as if they preceded all
+other arguments.
+
+$RETURN_IN_ORDER means that all arguments maintain their ordering.
+When nextOption is called, and the next argument is not an option, it
+returns the null string as the option and the argument as the value.
+nextOption never returns the null list until all the arguments have
+been processed.
+
+=item $ignoreCase
+
+Ignore case when matching options.  Default is 1 unless the option
+descriptions contain an upper-case letter.
+
+=item $optionStart
+
+A string of characters that can start options.  Default is "-".
+
+=item $badOption
+
+A reference to a function that is called when an unrecognized option
+is encountered.  The function receives three arguments.  C<$_[0]> is the
+position in C<@ARGV> where the option came from.  C<$_[1]> is the option as
+the user typed it (including the option start character).  C<$_[2]> is
+either undef or a string describing the reason the option was not
+recognized (Currently, the only possible value is 'ambiguous', for a
+long option with several possible matches).  The option has already
+been removed from C<@ARGV>.  To put it back, you can say:
+
+    splice(@ARGV,$_[0],0,$_[1]);
+
+The function can do anything you want to C<@ARGV>.  It should return
+whatever you want nextOption to return.
+
+The default is a function that prints an error message and exits the
+program.
+
+=item $checkArg
+
+A reference to a function that is called to make sure the argument
+type is correct.  The function receives four arguments.  C<$_[0]> is the
+position in C<@ARGV> where the option came from.  C<$_[1]> is the text
+following the option, or undefined if there was no text following the
+option.  C<$_[2]> is the name of the option as the user typed it
+(including the option start character), suitable for error messages.
+C<$_[3]> is the argument type specifier.
+
+The function can do anything you want to C<@ARGV>.  It should return
+the value for this option.
+
+The default is a function that prints an error message and exits the
+program if the argument is not the right type for the option.  You can
+also adjust the behavior of the default function by changing
+C<$intRegexp> or C<$floatRegexp>.
+
+=item $intRegexp
+
+A regular expression that matches an integer.  Default is
+'^[-+]?\d+$', which matches a string of digits preceded by an
+optional sign.  Unlike the other configuration variables, this cannot
+be changed after nextOption is called, because the pattern is compiled
+only once.
+
+=item $floatRegexp
+
+A regular expression that matches a floating point number.  Default is
+'^[-+]?(\d*\.?\d+|\d+\.)$', which matches the following formats:
+"123", "123.", "123.45", and ".123" (plus an optional sign).  It does
+not match exponential notation.  Unlike the other configuration
+variables, this cannot be changed after nextOption is called, because
+the pattern is compiled only once.
+
+=item $typeChars
+
+A string of the characters which are legal argument types.  The
+default is 'sif', for String, Integer, and Floating point arguments.
+The string should consist only of letters.  Upper case letters are
+discouraged, since this will hamper the case-folding of options.  If
+you change this, you should set $checkType to a function that will
+check arguments of your new type.  Unlike the other configuration
+variables, this must be set I<before> calling init(), and cannot be
+changed afterwards.
+
+=item $checkType
+
+If you add new types to C<$typeChars>, you should set this to a function
+which will check arguments of the new types.
+
+=back
+
+=head1 CONFIGURATION AND ENVIRONMENT
+
+Getopt::Mixed requires no configuration files or environment variables.
+
+=head1 INCOMPATIBILITIES
+
+None reported.
+
+=head1 BUGS AND LIMITATIONS
+
+=over 4
+
+=item *
+
+This document should be expanded.
+
+=item *
+
+A long option must be at least two characters long.  Sorry.
+
+=item *
+
+The C<!> argument specifier of Getopt::Long is not supported, but you
+could have options B<--foo> and B<--nofoo> and then do something like:
+
+    $opt_foo = 0 if $opt_nofoo;
+
+=item *
+
+The C<@> argument specifier of Getopt::Long is not supported.  If you
+want your values pushed into an array, you'll have to use nextOption
+and do it yourself.
+
+=back
+
+=head1 AUTHOR
+
+Christopher J. Madsen  S<C<< <perl AT cjmweb.net> >>>
+
+Please report any bugs or feature requests
+to S<C<< <bug-Getopt-Mixed AT rt.cpan.org> >>>
+or through the web interface at
+L<< http://rt.cpan.org/Public/Bug/Report.html?Queue=Getopt-Mixed >>.
+
+You can follow or contribute to Getopt::Mixed's development at
+L<< http://github.com/madsen/getopt-mixed >>.
+
+Thanks are also due to Andreas Koenig for helping Getopt::Mixed
+conform to the standards for Perl modules and for answering a bunch of
+questions.  Any remaining deficiencies are my fault.
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is copyright (c) 1995 by Christopher J. Madsen.
+
+This is free software; you can redistribute it and/or modify it under
+the same terms as the Perl 5 programming language system itself.
+
+=head1 DISCLAIMER OF WARRANTY
+
+BECAUSE THIS SOFTWARE IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY
+FOR THE SOFTWARE, TO THE EXTENT PERMITTED BY APPLICABLE LAW. EXCEPT WHEN
+OTHERWISE STATED IN WRITING THE COPYRIGHT HOLDERS AND/OR OTHER PARTIES
+PROVIDE THE SOFTWARE "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER
+EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE
+ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE IS WITH
+YOU. SHOULD THE SOFTWARE PROVE DEFECTIVE, YOU ASSUME THE COST OF ALL
+NECESSARY SERVICING, REPAIR, OR CORRECTION.
+
+IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR
+REDISTRIBUTE THE SOFTWARE AS PERMITTED BY THE ABOVE LICENSE, BE
+LIABLE TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL,
+OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE
+THE SOFTWARE (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING
+RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A
+FAILURE OF THE SOFTWARE TO OPERATE WITH ANY OTHER SOFTWARE), EVEN IF
+SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+=cut
+
+}
+
+package MobiPerl::EXTH; BEGIN { $INC{"MobiPerl/EXTH.pm"} = "MobiPerl/EXTH.pm" }
+BEGIN {
+#    Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    MobiPerl/EXTH.pm, Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+
+# 400-499 application binary
+# 500-599 application string
+
+my %typename_to_type = ("drm_server_id" => 1,
+			"drm_commerce_id" => 2,
+			"drm_ebookbase_book_id" => 3,
+			"author" => 100,
+			"publisher" => 101,
+			"imprint" => 102,
+			"description" => 103,
+			"isbn" => 104,
+			"subject" => 105,
+			"publishingdate" => 106,
+			"review" => 107,
+			"contributor" => 108,
+			"rights" => 109,
+			"subjectcode" => 110,
+			"type" => 111,
+			"source" => 112,
+			"asin" => 113,
+			"versionnumber" => 114,
+			"sample" => 115,
+			"startreading" => 116,
+			"coveroffset" => 201,
+			"thumboffset" => 202,
+			"hasfakecover" => 203,
+			"204"          => 204,
+			"205"          => 205,
+			"206"          => 206,
+			"207"          => 207,
+			"clippinglimit" => 401,  # varies in size 1 or 4 seend
+			"publisherlimit" => 402,
+			"403"          => 403,
+			"ttsflag"          => 404,
+			"cdetype"      => 501,
+			"lastupdatetime" => 502,
+			"updatedtitle"   => 503,
+			);
+
+my %type_to_desc = (1 => "drm_server_id",
+		    2 => "drm_commerce_id",
+		    3 => "drm_ebookbase_book_id",
+		    100 => "Author",
+		    101 => "Publisher",
+		    102 => "Imprint",
+		    103 => "Description",
+		    104 => "ISBN",
+		    105 => "Subject",
+		    106 => "PublishingDate",
+		    107 => "Review",
+		    108 => "Contributor",
+		    109 => "Rights",
+		    110 => "SubjectCode",
+		    111 => "Type",
+		    112 => "Source",
+		    113 => "ASIN",
+		    114 => "VersionNumber",
+		    115 => "Sample",
+		    116 => "StartReading",
+		    201 => "CoverOffset",
+		    202 => "ThumbOffset",
+		    203 => "hasFakeCover",
+		    401 => "ClippingLimit",
+		    402 => "PublisherLimit",
+		    404 => "TTSFlag",
+		    501 => "CDEContentType",
+		    502 => "LastUpdateTime",
+		    503 => "UpdatedTitle",
+		    504 => "cDEContentKey",
+		    );
+
+my %binary_data = (114 => 1,
+		   115 => 1,
+		   201 => 1,
+		   202 => 1,
+		   203 => 1,
+		   204 => 1,
+		   205 => 1,
+		   206 => 1,
+		   207 => 1,
+		   300 => 1,
+		   401 => 1,
+		   403 => 1,
+		   404 => 1,
+		   );
+
+my %format = (114 => 4,
+	      201 => 4,
+	      202 => 4,
+	      203 => 4,
+	      204 => 4,
+	      205 => 4,
+	      206 => 4,
+	      207 => 4,
+	      403 => 1);
+
+
+
+
+sub new {
+    my $this = shift;
+    my $data = shift;
+    my $class = ref($this) || $this;
+    my $obj = bless {
+	TYPE => [],
+	DATA => [],
+	@_
+    }, $class;
+    $obj->initialize_from_data ($data) if defined $data;
+    return $obj;
+}
+
+sub get_string {
+    my $self = shift;
+    my @type = @{$self->{TYPE}};
+    my @data = @{$self->{DATA}};
+    my $res = "";
+    foreach my $i (0..$#type) {
+	my $type = $type[$i];
+	my $data = $data[$i];
+	my $typedesc = $type;
+	if (defined $type_to_desc{$type}) {
+	    $typedesc = $type_to_desc{$type};
+	    if (defined $binary_data{$type}) {
+		$res .= $typedesc . " - " . "not printable" . "\n";
+	    } else {
+		$res .= $typedesc . " - " . $data . "\n";
+	    }
+	}
+    }
+    return $res;
+}
+
+sub add {
+    my $self = shift;
+    my $typename = shift;
+    my $data = shift;
+    my $type = $self->get_type ($typename);
+    if (is_binary_data ($type)) {
+	my $hex = MobiPerl::Util::iso2hex ($data);
+	print "EXTH add: $typename - $type - ", int($data), " - $hex\n";
+    } else {
+	print "EXTH add: $typename - $type - $data\n";
+    }
+    if ($type) {
+	push @{$self->{TYPE}}, $type;
+	push @{$self->{DATA}}, $data;
+    } else {
+	print STDERR "WARNING: $typename is not defined as an EXTH type\n";
+    }
+    return $type;
+}
+
+sub delete {
+    my $self = shift;
+    my $typename = shift;
+    my $delexthindex = shift;
+    my $type = $self->get_type ($typename);
+    print "EXTH delete: $typename - $type - $delexthindex\n";
+    if ($type) {
+	my @type = @{$self->{TYPE}};
+	my @data = @{$self->{DATA}};
+	@{$self->{TYPE}} = ();
+	@{$self->{DATA}} = ();
+	my $index = 0;
+	foreach my $i (0..$#type) {
+##	    print STDERR "TYPE: $type[$i]\n";
+	    if ($type[$i] == $type) {
+		$index++;
+##		print STDERR "INDEX: $index\n";
+	    }
+	    if ($type[$i] == $type and 
+		($delexthindex == 0 or $delexthindex == $index)) {
+		if (is_binary_data ($type[$i])) {
+		    my $hex = MobiPerl::Util::iso2hex ($data[$i]);
+		    print STDERR "DELETING $type[$i]: ", int($data[$i]), " - $hex\n";
+		} else {
+		    print STDERR "DELETING $type[$i]: $data[$i]\n";
+		}
+	    } else {
+		push @{$self->{TYPE}}, $type[$i];
+		push @{$self->{DATA}}, $data[$i];
+	    }
+	}
+    } else {
+	print STDERR "WARNING: $typename is not defined as an EXTH type\n";
+    }
+}
+
+sub get_type {
+    my $self = shift;
+    my $typename = shift;
+    my $res = 0;
+###    print "EXTH: GETTYPE: $typename\n";
+    if (defined $typename_to_type{$typename}) {
+	$res = $typename_to_type{$typename};
+    } else {
+	if ($typename =~ /^\d+$/) {
+	    $res = $typename;
+	}
+    }
+    return $res;
+}
+
+sub set {
+    my $self = shift;
+    my $typename = shift;
+    my $data = shift;
+    my $type = $self->get_type ($typename);
+    my $hex = MobiPerl::Util::iso2hex ($data);
+    print "EXTH setting data: $typename - $type - $data - $hex\n";
+    if ($type) {
+	my @type = @{$self->{TYPE}};
+	my @data = @{$self->{DATA}};
+	my $found = 0;
+	foreach my $i (0..$#type) {
+	    if ($type[$i] == $type) {
+		print "EXTH replacing data: $type - $data - $hex\n";
+		$self->{TYPE}->[$i] = $type;
+		$self->{DATA}->[$i] = $data;
+		$found = 1;
+		last;
+	    }
+	}
+	if (not $found) {
+	    $self->add ($typename, $data);
+	}
+    }
+    return $type;
+}
+
+sub initialize_from_data {
+    my $self = shift;
+    my $data = shift;
+    my ($doctype, $len, $n_items) = unpack ("a4NN", $data);
+##    print "EXTH doctype: $doctype\n";
+##    print "EXTH  length: $len\n";
+##    print "EXTH n_items: $n_items\n";
+    my $pos = 12;
+    foreach (1..$n_items) {
+	my ($type, $size) = unpack ("NN", substr ($data, $pos));
+	$pos += 8;
+	my $contlen = $size-8;
+	my ($content) = unpack ("a$contlen", substr ($data, $pos));
+	if (defined $format{$type}) {
+	    my $len = $format{$type};
+##	    print STDERR "TYPE:$type:$len\n";
+	    if ($len == 4) {
+		($content) = unpack ("N", substr ($data, $pos));
+##		print STDERR "CONT:$content\n";
+	    }
+	    if ($len == 1) {
+		($content) = unpack ("C", substr ($data, $pos));
+##		print STDERR "CONT:$content\n";
+	    }
+	}
+	push @{$self->{TYPE}}, $type;
+	push @{$self->{DATA}}, $content;
+	$pos += $contlen;
+    }
+    if ($self->get_data () ne substr ($data, 0, $len)) {
+	print STDERR "ERROR: generated EXTH does not match original\n";
+	my $s1 = $self->get_data ();
+	my $s0 = substr ($data, 0, $len);
+	foreach my $i (0..length ($s0)-1) {
+	    if (substr ($s0, $i, 1) ne substr ($s1, $i, 1)) {
+		my $c0 = substr ($s0, $i, 1);
+		my $c1 = substr ($s1, $i, 1);
+		$c0 = MobiPerl::Util::iso2hex ($c0);
+		$c1 = MobiPerl::Util::iso2hex ($c1);
+		print STDERR "MISMATCH POS:$i:$c0:$c1\n";
+	    }
+	}
+    }
+#    open EXTH0, ">exth0";
+#    print EXTH0 substr ($data, 0, $len);
+#    open EXTH1, ">exth1";
+#    print EXTH1 $self->get_data ();
+}
+
+sub get_data {
+    my $self = shift;
+    my @type = @{$self->{TYPE}};
+    my @data = @{$self->{DATA}};
+    my $exth = pack ("a*", "EXTH");
+    my $content = "";
+    my $n_items = 0;
+    foreach my $i (0..$#type) {
+	my $type = $type[$i];
+	my $data = $data[$i];
+	next unless defined $data; # remove type...
+	if (defined $format{$type}) {
+	    my $len = $format{$type};
+	    if ($len == 4) {
+		$content .= pack ("NNN", $type, $len+8, $data);
+	    }
+	    if ($len == 1) {
+		$content .= pack ("NNC", $type, $len+8, $data);
+	    }
+	} else {
+	    $content .= pack ("NNa*", $type, length ($data)+8, $data);
+	}
+	$n_items++;
+    }
+    #
+    # Maybe fill up to even 4...
+    #
+
+    my $comp = length ($content) % 4;
+    if ($comp) {
+	foreach ($comp .. 3) {
+	    $content .= pack ("C", 0);
+	}
+    }
+    $exth .= pack ("NN", length ($content)+12, $n_items);
+    $exth .= $content;
+    return $exth;
+}
+
+sub get_cover_offset {
+    my $self = shift;
+    my @type = @{$self->{TYPE}};
+    my @data = @{$self->{DATA}};
+# pdurrant: 0 is a valid cover offset, so return -1 if not found
+    my $res = -1;
+#    my $res = 0;
+    foreach my $i (0..$#type) {
+	if ($type[$i] == 201) {
+##	    print STDERR "TYPE: $type[$i] - $data[$i]\n";
+##	    ($res) = unpack ("N", $data[$i]);
+	    $res = $data[$i];
+##	    print STDERR "RES: $res\n";
+	}
+    }
+    return $res;
+}
+
+sub get_thumb_offset {
+    my $self = shift;
+    my @type = @{$self->{TYPE}};
+    my @data = @{$self->{DATA}};
+# pdurrant: 0 is a valid cover offset, so return -1 if not found
+    my $res = -1;
+#    my $res = 0;
+    foreach my $i (0..$#type) {
+	if ($type[$i] == 202) {
+	    $res = $data[$i];
+	}
+    }
+    return $res;
+}
+
+#
+# Non object methods
+#
+
+sub get_description {
+    my $type = shift;
+    my $res = $type;
+    if (defined $type_to_desc{$type}) {
+	$res = $type_to_desc{$type};
+    }
+    return $res;
+}
+
+sub is_binary_data {
+    my $type = shift;
+    return $binary_data{$type};
+}
+
+}
+
+package MobiPerl::MobiHeader; BEGIN { $INC{"MobiPerl/MobiHeader.pm"} = "MobiPerl/MobiHeader.pm" }
+BEGIN {
+use strict;
+
+#    Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    MobiPerl/MobiHeader.pm, Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+#
+# This is a patch of a function in Palm::Doc to be able to handle
+# DRM:ed files.
+#
+
+
+#use FindBin qw($RealBin);
+#use lib "$RealBin";
+
+use MobiPerl::EXTH;
+
+use strict;
+
+#
+# TYPE: 2=book
+#
+# VERSION: Should be 3 or 4
+#
+# CODEPAGE: utf-8: 65001; westerner: 1252
+#
+# IMAGERECORDINDEX: the index of the first record with image in it
+#
+# Language seems to be stored in 4E: en-us    0409
+#                                       sv    041d
+#                                       fi    000b
+#                                       en    0009
+#
+# 0x50 and 0x54 might also be some kind of language specification
+#
+
+#
+# 0000: MOBI        header-size type      codepage 
+# 0010: unique-id   version     FFFFFFFF  FFFFFFFF
+#
+# header-size = E4 if version = 4
+# type        = 2 - book
+# codepage    = 1252 - westerner
+# unique-id   = seems to be random
+# version     = 3 or 4
+#
+# 0040: data4  exttitleoffset exttitlelength language
+# 0050: data1  data2          data3          nonbookrecordpointer
+# 0060: data5
+#
+# data1 and data2 id 09 in Oxford dictionary. The same as languange...
+# nonbookrecordpointer in Oxford is 0x7167. data5 is 0x7157
+# data3 is 05 in Oxford so maybe this is the version?
+#
+#pdurrant:
+#
+# 0040: nonbookrecordpointer  exttitleoffset exttitlelength language
+# 0050: data1  data2          data3          firstimagerecordpointer
+# 0060: data5
+#
+
+
+my %langmap = (
+	       "es"    => 0x000a,
+	       "sv"    => 0x001d,
+	       "sv-se" => 0x041d,
+	       "sv-fi" => 0x081d,
+	       "fi"    => 0x000b,
+	       "en"    => 0x0009,
+	       "en-au" => 0x0C09,
+	       "en-bz" => 0x2809,
+	       "en-ca" => 0x1009,
+	       "en-cb" => 0x2409,
+	       "en-ie" => 0x1809,
+	       "en-jm" => 0x2009,
+	       "en-nz" => 0x1409,
+	       "en-ph" => 0x3409,
+	       "en-za" => 0x1c09,
+	       "en-tt" => 0x2c09,
+	       "en-us" => 0x0409,
+	       "en-gb" => 0x0809,
+	       "en-zw" => 0x3009,
+	       "da"    => 0x0006,
+	       "da-dk" => 0x0406,
+	       "da"    => 0x0006,
+	       "da"    => 0x0006,
+	       "nl"    => 0x0013,
+	       "nl-be" => 0x0813,
+	       "nl-nl" => 0x0413,
+	       "fi"    => 0x000b,
+	       "fi-fi" => 0x040b,
+	       "fr"    => 0x000c,
+	       "fr-fr" => 0x040c,
+	       "de"    => 0x0007,
+	       "de-at" => 0x0c07,
+	       "de-de" => 0x0407,
+	       "de-lu" => 0x1007,
+	       "de-ch" => 0x0807,
+	       "no"    => 0x0014,
+	       "nb-no" => 0x0414,
+	       "nn-no" => 0x0814,
+);
+
+
+my %mainlanguage = (
+		 0 => "NEUTRAL",
+		 54 => "AFRIKAANS",
+		 28 => "ALBANIAN",
+		 1 => "ARABIC",
+		 43 => "ARMENIAN",
+		 77 => "ASSAMESE",
+		 44 => "AZERI",
+		 45 => "BASQUE",
+		 35 => "BELARUSIAN",
+		 69 => "BENGALI",
+		 2 => "BULGARIAN",
+		 3 => "CATALAN",
+		 4 => "CHINESE",
+		 26 => "CROATIAN",
+		 5 => "CZECH",
+		 6 => "DANISH",
+		 19 => "DUTCH",
+		 9 => "ENGLISH",
+		 37 => "ESTONIAN",
+		 56 => "FAEROESE",
+		 41 => "FARSI",
+		 11 => "FINNISH",
+		 12 => "FRENCH",
+		 55 => "GEORGIAN",
+		 7 => "GERMAN",
+		 8 => "GREEK",
+		 71 => "GUJARATI",
+		 13 => "HEBREW",
+		 57 => "HINDI",
+		 14 => "HUNGARIAN",
+		 15 => "ICELANDIC",
+		 33 => "INDONESIAN",
+		 16 => "ITALIAN",
+		 17 => "JAPANESE",
+		 75 => "KANNADA",
+		 63 => "KAZAK",
+		 87 => "KONKANI",
+		 18 => "KOREAN",
+		 38 => "LATVIAN",
+		 39 => "LITHUANIAN",
+		 47 => "MACEDONIAN",
+		 62 => "MALAY",
+		 76 => "MALAYALAM",
+		 58 => "MALTESE",
+		 78 => "MARATHI",
+		 97 => "NEPALI",
+		 20 => "NORWEGIAN",
+		 72 => "ORIYA",
+		 21 => "POLISH",
+		 22 => "PORTUGUESE",
+		 70 => "PUNJABI",
+		 23 => "RHAETOROMANIC",
+		 24 => "ROMANIAN",
+		 25 => "RUSSIAN",
+		 59 => "SAMI",
+		 79 => "SANSKRIT",
+		 26 => "SERBIAN",
+		 27 => "SLOVAK",
+		 36 => "SLOVENIAN",
+		 46 => "SORBIAN",
+		 10 => "SPANISH",
+		 48 => "SUTU",
+		 65 => "SWAHILI",
+		 29 => "SWEDISH",
+		 73 => "TAMIL",
+		 68 => "TATAR",
+		 74 => "TELUGU",
+		 30 => "THAI",
+		 49 => "TSONGA",
+		 50 => "TSWANA",
+		 31 => "TURKISH",
+		 34 => "UKRAINIAN",
+		 32 => "URDU",
+		 67 => "UZBEK",
+		 42 => "VIETNAMESE",
+		 52 => "XHOSA",
+		 53 => "ZULU",
+		 );
+
+
+my $langmap = {};
+$langmap->{"ENGLISH"} = {
+		   1 => "ENGLISH_US",
+		   2 => "ENGLISH_UK",
+		   3 => "ENGLISH_AUS",
+		   4 => "ENGLISH_CAN",
+		   5 => "ENGLISH_NZ",
+		   6 => "ENGLISH_EIRE",
+		   7 => "ENGLISH_SOUTH_AFRICA",
+		   8 => "ENGLISH_JAMAICA",
+		   10 => "ENGLISH_BELIZE",
+		   11 => "ENGLISH_TRINIDAD",
+		   12 => "ENGLISH_ZIMBABWE",
+		   13 => "ENGLISH_PHILIPPINES",
+	       };
+
+my %sublanguage = (
+		   0 => "NEUTRAL",
+		   1 => "ARABIC_SAUDI_ARABIA",
+		   2 => "ARABIC_IRAQ",
+		   3 => "ARABIC_EGYPT",
+		   4 => "ARABIC_LIBYA",
+		   5 => "ARABIC_ALGERIA",
+		   6 => "ARABIC_MOROCCO",
+		   7 => "ARABIC_TUNISIA",
+		   8 => "ARABIC_OMAN",
+		   9 => "ARABIC_YEMEN",
+		   10 => "ARABIC_SYRIA",
+		   11 => "ARABIC_JORDAN",
+		   12 => "ARABIC_LEBANON",
+		   13 => "ARABIC_KUWAIT",
+		   14 => "ARABIC_UAE",
+		   15 => "ARABIC_BAHRAIN",
+		   16 => "ARABIC_QATAR",
+		   1 => "AZERI_LATIN",
+		   2 => "AZERI_CYRILLIC",
+		   1 => "CHINESE_TRADITIONAL",
+		   2 => "CHINESE_SIMPLIFIED",
+		   3 => "CHINESE_HONGKONG",
+		   4 => "CHINESE_SINGAPORE",
+		   1 => "DUTCH",
+		   2 => "DUTCH_BELGIAN",
+		   1 => "FRENCH",
+		   2 => "FRENCH_BELGIAN",
+		   3 => "FRENCH_CANADIAN",
+		   4 => "FRENCH_SWISS",
+		   5 => "FRENCH_LUXEMBOURG",
+		   6 => "FRENCH_MONACO",
+		   1 => "GERMAN",
+		   2 => "GERMAN_SWISS",
+		   3 => "GERMAN_AUSTRIAN",
+		   4 => "GERMAN_LUXEMBOURG",
+		   5 => "GERMAN_LIECHTENSTEIN",
+		   1 => "ITALIAN",
+		   2 => "ITALIAN_SWISS",
+		   1 => "KOREAN",
+		   1 => "LITHUANIAN",
+		   1 => "MALAY_MALAYSIA",
+		   2 => "MALAY_BRUNEI_DARUSSALAM",
+		   1 => "NORWEGIAN_BOKMAL",
+		   2 => "NORWEGIAN_NYNORSK",
+		   2 => "PORTUGUESE",
+		   1 => "PORTUGUESE_BRAZILIAN",
+		   2 => "SERBIAN_LATIN",
+		   3 => "SERBIAN_CYRILLIC",
+		   1 => "SPANISH",
+		   2 => "SPANISH_MEXICAN",
+		   4 => "SPANISH_GUATEMALA",
+		   5 => "SPANISH_COSTA_RICA",
+		   6 => "SPANISH_PANAMA",
+		   7 => "SPANISH_DOMINICAN_REPUBLIC",
+		   8 => "SPANISH_VENEZUELA",
+		   9 => "SPANISH_COLOMBIA",
+		   10 => "SPANISH_PERU",
+		   11 => "SPANISH_ARGENTINA",
+		   12 => "SPANISH_ECUADOR",
+		   13 => "SPANISH_CHILE",
+		   14 => "SPANISH_URUGUAY",
+		   15 => "SPANISH_PARAGUAY",
+		   16 => "SPANISH_BOLIVIA",
+		   17 => "SPANISH_EL_SALVADOR",
+		   18 => "SPANISH_HONDURAS",
+		   19 => "SPANISH_NICARAGUA",
+		   20 => "SPANISH_PUERTO_RICO",
+		   1 => "SWEDISH",
+		   2 => "SWEDISH_FINLAND",
+		   1 => "UZBEK_LATIN",
+		   2 => "UZBEK_CYRILLIC",
+		   );
+
+my %booktypedesc = (2 => "BOOK",
+		    3 => "PALMDOC",
+		    4 => "AUDIO",
+		    257 => "NEWS",
+		    258 => "NEWS_FEED",
+		    259 => "NEWS_MAGAZINE",
+		    513 => "PICS",
+		    514 => "WORD",
+		    515 => "XLS",
+		    516 => "PPT",
+		    517 => "TEXT",
+		    518 => "HTML",
+		   );
+
+sub new {
+    my $this = shift;
+    my $class = ref($this) || $this;
+    bless {
+	TYPE => 2,
+	VERSION => 4,
+	CODEPAGE => 1252,
+	TITLE => "Unspecified Title",
+	AUTHOR => "Unspecified Author",
+	PUBLISHER => "",
+	DESCRIPTION => "",
+	SUBJECT => "",
+	IMAGERECORDINDEX => 0,
+	LANGUAGE => "en",
+	COVEROFFSET => -1,
+	THUMBOFFSET => -1,
+	@_
+    }, $class;
+}
+
+sub set_author {
+    my $self = shift;
+    my $val = shift;
+    $self->{AUTHOR} = $val;
+}
+
+sub get_author {
+    my $self = shift;
+    return $self->{AUTHOR};
+}
+
+sub set_cover_offset {
+    my $self = shift;
+    my $val = shift;
+    $self->{COVEROFFSET} = $val;
+}
+
+sub get_cover_offset {
+    my $self = shift;
+    return $self->{COVEROFFSET};
+}
+
+sub set_thumb_offset {
+    my $self = shift;
+    my $val = shift;
+    $self->{THUMBOFFSET} = $val;
+}
+
+sub get_thumb_offset {
+    my $self = shift;
+    return $self->{THUMBOFFSET};
+}
+
+sub set_publisher {
+    my $self = shift;
+    my $val = shift;
+    $self->{PUBLISHER} = $val;
+}
+
+sub get_publisher {
+    my $self = shift;
+    return $self->{PUBLISHER};
+}
+
+sub set_description {
+    my $self = shift;
+    my $val = shift;
+    $self->{DESCRIPTION} = $val;
+}
+
+sub get_description {
+    my $self = shift;
+    return $self->{DESCRIPTION};
+}
+
+sub set_subject {
+    my $self = shift;
+    my $val = shift;
+    $self->{SUBJECT} = $val;
+}
+
+sub get_subject {
+    my $self = shift;
+    return $self->{SUBJECT};
+}
+
+sub set_language {
+    my $self = shift;
+    my $val = shift;
+    $self->{LANGUAGE} = $val;
+}
+
+sub get_language {
+    my $self = shift;
+    return $self->{LANGUAGE};
+}
+
+sub set_title {
+    my $self = shift;
+    my $val = shift;
+    $self->{TITLE} = $val;
+}
+
+sub get_title {
+    my $self = shift;
+    return $self->{TITLE};
+}
+
+sub set_image_record_index {
+    my $self = shift;
+    my $val = shift;
+    $self->{IMAGERECORDINDEX} = $val;
+}
+
+sub get_image_record_index {
+    my $self = shift;
+    return $self->{IMAGERECORDINDEX};
+}
+
+sub get_type {
+    my $self = shift;
+    return $self->{TYPE};
+}
+
+sub get_codepage {
+    my $self = shift;
+    return $self->{CODEPAGE};
+}
+
+sub set_codepage {
+    my $self = shift;
+    my $value = shift;
+    $self->{CODEPAGE} = $value;
+}
+
+sub set_version {
+    my $self = shift;
+    my $val = shift;
+    $self->{VERSION} = $val;
+}
+
+sub get_version {
+    my $self = shift;
+    return $self->{VERSION};
+}
+
+sub get_unique_id {
+    my $self = shift;
+    my $r1 = int (rand (256));
+    my $r2 = int (rand (256));
+    my $r3 = int (rand (256));
+    my $r4 = int (rand (256));
+    my $res = $r1+$r2*256+$r3*256*256+$r4*256*256*256;
+    return $res;
+}
+
+sub get_header_size {
+    my $self = shift;
+    my $res = 0x74;
+    if ($self->get_version () == 4) {
+	$res = 0xE4;
+    }
+    return $res;
+}
+
+sub get_extended_header_data {
+    my $self = shift;
+    my $author = $self->get_author ();
+
+    my $eh = new MobiPerl::EXTH;
+    $eh->set ("author", $author);
+    my $pub = $self->get_publisher ();
+    $eh->set ("publisher", $pub) if $pub;
+
+    my $desc = $self->get_description ();
+    $eh->set ("description", $desc) if $desc;
+
+    my $subj = $self->get_subject ();
+    $eh->set ("subject", $subj) if $subj;
+
+    my $coffset = $self->get_cover_offset ();
+    if ($coffset >= 0) {
+##	my $data = pack ("N", $coffset);
+##	print STDERR "COFFSET:$coffset:$data:\n";
+	$eh->set ("coveroffset", $coffset);
+    }
+
+    my $toffset = $self->get_thumb_offset ();
+    if ($toffset >= 0) {
+##	my $data = pack ("N", $toffset);
+##	my $hex = MobiPerl::Util::iso2hex ($data);
+##	print STDERR "TOFFSET:$toffset:$hex\n";
+	$eh->set ("thumboffset", $toffset);
+    }
+
+##    $eh->set ("hasfakecover", pack ("N", 0));
+
+    return $eh->get_data ();
+}
+
+sub get_data {
+    my $self = shift;
+    my $res = "";
+
+    my $vie1 = 0; # 0x11 Alice 0x0D Rosenbaum 0xFFFFFFFF, Around the world
+    $vie1 = 0xFFFFFFFF;
+
+    my $vie2 = 0x04; # had this, around the world have 0x01
+
+    my $use_extended_header = 1;
+    my $extended_header_flag = 0x00;
+    if ($use_extended_header) {
+	$extended_header_flag = 0x50; # At MOBI+0x70
+    }
+
+    my $extended_title_offset = $self->get_header_size () + 16 + length ($self->get_extended_header_data ());
+    my $extended_title_length = length ($self->get_title ());
+
+    print "MOBIHDR: imgrecpointer: ", $self->get_image_record_index (), "\n";
+
+    $res .= pack ("a*NNNNN", "MOBI",
+		  $self->get_header_size (), 
+		  $self->get_type (), 
+		  $self->get_codepage (), 
+		  $self->get_unique_id (), 
+		  $self->get_version ());
+
+    $res .= pack ("NN", 0xFFFFFFFF, 0xFFFFFFFF);
+    $res .= pack ("NNNN", 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    $res .= pack ("NNNN", 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);
+    my $langnumber = $self->get_language ();
+    if (defined $langmap{$langnumber}) {
+	$langnumber = $langmap{$langnumber};
+    }
+    $res .= pack ("NNNN", $vie1, $extended_title_offset, 
+		  $extended_title_length, $langnumber);
+    $res .= pack ("NNNN", 0xFFFFFFFF, 0xFFFFFFFF, $vie2, $self->get_image_record_index ());
+    $res .= pack ("NNNN", 0xFFFFFFFF, 0, 0xFFFFFFFF, 0);
+    $res .= pack ("N", $extended_header_flag);
+#    print STDERR "MOBIHEADERSIZE: $mobiheadersize " . length ($header->{'data'}). "\n";
+    while (length ($res) < $self->get_header_size ()) {
+###	print STDERR "LEN: " . length ($res) . " - " . $self->get_header_size () . "\n";
+	$res .= pack ("N", 0);
+    }
+
+    substr ($res, 0x94, 4, pack ("N", 0xFFFFFFFF));
+    substr ($res, 0x98, 4, pack ("N", 0xFFFFFFFF));
+
+    substr ($res, 0xb0, 4, pack ("N", 0xFFFFFFFF)); 
+    # maybe pointer to last image or to thumbnail image record
+
+    substr ($res, 0xb8, 4, pack ("N", 0xFFFFFFFF)); # record pointer
+    substr ($res, 0xc0, 4, pack ("N", 0xFFFFFFFF)); # record pointer
+    substr ($res, 0xc8, 4, pack ("N", 0xFFFFFFFF)); # record pointer
+
+    #
+    # unknown
+    #
+
+    substr ($res, 0xd0, 4, pack ("N", 0xFFFFFFFF));
+    substr ($res, 0xd8, 4, pack ("N", 0xFFFFFFFF));
+    substr ($res, 0xdc, 4, pack ("N", 0xFFFFFFFF));
+
+
+    $res .= $self->get_extended_header_data ();
+    $res .= pack ("a*", $self->get_title ());
+    
+    #
+    # Why?
+    #
+    for (1..48) {
+	$res .= pack ("N", 0);
+    }
+    return $res;
+}
+
+
+#
+# Help function that is not dependent on object state
+#
+
+sub get_extended_title {
+    my $h = shift;
+    my $len = length ($h);
+    my ($exttitleoffset) = unpack ("N", substr ($h, 0x44));
+    my ($exttitlelength) = unpack ("N", substr ($h, 0x48));
+    my ($title) = unpack ("a$exttitlelength", substr ($h, $exttitleoffset-16));
+    return $title;
+}
+
+sub set_extended_title {
+    my $mh = shift;
+    my $len = length ($mh);
+    my $title = shift;
+    my $titlelen = length ($title);
+    my ($exttitleoffset) = unpack ("N", substr ($mh, 0x44));
+    my ($exttitlelength) = unpack ("N", substr ($mh, 0x48));
+    my ($version) = unpack ("N", substr ($mh, 0x14));
+
+    my $res = substr ($mh, 0, $exttitleoffset-16);
+    my $aftertitle = substr ($mh, $exttitleoffset-16+$exttitlelength);
+
+    $res .= $title;
+
+    my $diff = $titlelen - $exttitlelength;
+    if ($diff <= 0) {
+	foreach ($diff .. -1) {
+	    $res .= pack ("C", 0);
+	    $diff++;
+	}
+    } else {
+	my $comp = $diff % 4;
+	if ($comp) {
+	    foreach ($comp .. 3) {
+		$res .= pack ("C", 0);
+		$diff++;
+	    }
+	}
+    }
+    $res = fix_pointers ($res, $exttitleoffset, $diff);
+
+    $res .= $aftertitle;
+    substr ($res, 0x48, 4, pack ("N", $titlelen));
+
+    return $res;
+}
+
+sub get_mh_language_code {
+    my $h = shift;
+    my $len = length ($h);
+    my ($lang) = unpack ("N", substr ($h, 0x4C));
+    return $lang;
+}
+
+sub get_language_desc {
+    my $code = shift;
+    my $lid = $code & 0xFF;
+    my $lang = $mainlanguage{$lid};
+    my $sublid = ($code >> 10) & 0xFF;
+    my $sublang = $langmap->{$lang}->{$sublid};
+    my $res = "";
+    $res .= "$lang";
+    $res .= " - $sublang";
+    return $res;
+}
+
+
+sub set_booktype {
+    my $mh = shift;
+    my $len = length ($mh);
+    my $type = shift;
+    substr ($mh, 0x08, 4, pack ("N", $type));
+    return $mh;
+}
+
+sub set_language_in_header {
+    my $mh = shift;
+    my $len = length ($mh);
+    my $lan = shift;
+
+    my $langnumber = $lan;
+    if (defined $langmap{$langnumber}) {
+	$langnumber = $langmap{$langnumber};
+    }
+
+    substr ($mh, 0x4C, 4, pack ("N", $langnumber));
+    return $mh;
+}
+
+sub add_exth_data {
+    my $h = shift;
+    my $type = shift;
+    my $data = shift;
+    return set_exth_data ($h, $type, $data, 1);
+}
+
+sub set_exth_data {
+    my $h = shift;
+    my $len = length ($h);
+    my $type = shift;
+    my $data = shift;
+    my $addflag = shift;
+    my $delexthindex = shift;
+    my $res = $h;
+    if (defined $data) {
+	print "Setting extended header data: $type - $data\n";
+    } else {
+	print "Deleting extended header data of type: $type - $delexthindex\n";
+    }
+
+    my ($doctype, $length, $htype, $codepage, $uniqueid, $ver) =
+	unpack ("a4NNNNN", $h);
+
+    my ($exthflg) = unpack ("N", substr ($h, 0x70));
+
+    my $exth = substr ($h, $length);
+    my $prefix = substr ($h, 0, $length);
+    my $suffix;
+    my $mobidiff = 0;
+    my $eh;
+    my $exthlen = 0;
+    if ($exthflg & 0x40) {
+	my ($doctype, $exthlen1, $n_items) = unpack ("a4NN", $exth);
+	$exthlen = $exthlen1;
+	$suffix = substr ($exth, $exthlen);
+	$eh = new MobiPerl::EXTH ($exth);
+    } else {
+	$eh = new MobiPerl::EXTH ();
+	$suffix = $exth;
+	substr ($prefix, 0x70, 4, pack ("N", $exthflg | 0x40));
+	# pdurrant: as well as setting the exthflg, we need make sure the version >= 4
+	if ($ver < 4) {
+	    substr($prefix, 0x14, 4, pack("N",4));
+	}
+
+    	# pdurrant: and if the mobi header is short, we need to increase its size
+    	if ($length < 0xE8) {
+	    if ($length < 0x9C) {
+    		#get rid of any old bad data inappropriate for new header
+    		$prefix = substr($prefix, 0, 0x74);
+	    }
+	    $prefix .= substr(pack("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF), length($prefix)-0xE8);
+	    $mobidiff = 0xE8-$length;
+	    substr ($prefix, 4, 4, pack ("N", 0xE8));
+	}
+    }
+
+    if ($addflag) {
+	$eh->add ($type, $data);
+    } else {
+	if (defined $data) {
+	    $eh->set ($type, $data);
+	} else {
+	    $eh->delete ($type, $delexthindex);
+	}
+    }
+    print "GETSTRING: ", $eh->get_string ();
+
+    #
+    # Fix DRM and TITLE info pointers...
+    #
+    
+    my $exthdata = $eh->get_data ();
+
+    my $exthdiff = length ($exthdata)-$exthlen;
+    if ($exthdiff <= 0) {
+	foreach ($exthdiff .. -1) {
+	    $exthdata .= pack ("C", 0);
+	    $exthdiff++;
+	}
+    }
+
+    $res = $prefix . $exthdata . $suffix;
+
+    $res = fix_pointers ($res, $length, $mobidiff+$exthdiff);
+
+    return $res;
+}
+
+
+sub fix_pointers {
+    my $mh = shift;
+    my $startblock = shift;
+    my $offset = shift;
+
+    #
+    # Fix pointers to long title and to DRM record
+    # 
+
+    my ($exttitleoffset) = unpack ("N", substr ($mh, 0x44));
+    if ($exttitleoffset > $startblock and $offset > 0) {
+	substr ($mh, 0x44, 4, pack ("N", $exttitleoffset+$offset));	
+    }
+    # pdurrant
+    my ($ehlen) = unpack ("N", substr ($mh,0x04));
+    if ($ehlen > 0x98 ) { #pdurrant
+	my ($drmoffset) = unpack ("N", substr ($mh, 0x98));
+	if ($drmoffset != 0xFFFFFFFF and
+	    $drmoffset > $startblock and $offset > 0) {
+	    substr ($mh, 0x98, 4, pack ("N", $drmoffset+$offset));
+	}
+    }
+    return $mh;
+}
+
+sub get_booktype_desc {
+    my $type = shift;
+    my $res = $type;
+    if (defined $booktypedesc{$type}) {
+	$res = $booktypedesc{$type};
+    }
+    return $res;
+}
+
+}
+
+package MobiPerl::Util; BEGIN { $INC{"MobiPerl/Util.pm"} = "MobiPerl/Util.pm" }
+BEGIN {
+#    Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    MobiPerl/Util.pm, Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+use strict;
+
+#use GD;
+#use Image::BMP;
+#use Image::Size qw(imgsize);
+#use File::Copy;
+#use File::Spec;
+
+use HTML::TreeBuilder;
+
+my $rescale_large_images = 0;
+
+
+sub is_cover_image {
+    my $file = shift;
+    my $res = 0;
+    if (not -e "$file") {
+	die "ERROR: File does not exist: $file";
+    }
+    die "ERROR: not implemented: is_cover_image";
+    my $p = new GD::Image ($file);
+    if (not defined $p) {
+	print STDERR "Could not read image file: $file\n";
+	return $res;
+    }
+    my ($x, $y) = $p->getBounds();
+#    my $x = $p->width;
+#    my $y = $p->height;
+    if ($x == 510 and $y == 680) {
+	print STDERR "GUESSING COVERIMAGE: $file\n";
+	$res = 1;
+    }
+    if ($x == 600 and $y == 800) {
+	print STDERR "GUESSING COVERIMAGE: $file\n";
+	$res = 1;
+    }
+    return $res;
+}
+
+#
+# OPF related functions
+#
+
+sub get_tree_from_opf {
+    my $file = shift;
+    my $config = shift;
+    my $linksinfo = shift;
+
+#    my ($vol,$dir,$basefile) = File::Spec->splitpath ($file);
+#    print STDERR "OPFFILE: $vol - $dir - $basefile\n";
+
+    my $opf = new MobiPerl::Opf ($file);
+    my $tochref = $opf->get_toc_href ();
+    my @opf_spine_ids = $opf->get_spine_ids ();
+    my @opf_manifest_ids = $opf->get_manifest_ids ();
+    my $title = $opf->get_title ();
+    print STDERR "OPFTITLE: $title\n";
+    if ($config->title ()) {
+	$title = $config->title ();
+    }
+    $title = $config->prefix_title () . $title;
+    $config->title ($title);
+
+    my $author = $opf->get_author ();
+    print STDERR "OPFAUTHOR: $author\n";
+    if (not $config->author ()) {
+	$config->author ($author);
+    }
+
+
+
+    #
+    # If cover image not assigned search all files in current dir
+    # and see if some file is a coverimage
+    #
+    
+    my $coverimage = $opf->get_cover_image ();
+    if ($coverimage eq "") {
+	opendir DIR, ".";
+	my @files = readdir (DIR);
+	foreach my $f (@files) {
+	    if ($f =~ /\.jpg/ or 
+		$f =~ /\.JPG/ or 
+		$f =~ /\.gif/) {
+#		print STDERR "Checking if file is coverimage: $f\n";
+		if (MobiPerl::Util::is_cover_image ($f)) {
+		    $coverimage = $f;
+		}
+	    }
+	}
+    }
+    print STDERR "Coverimage: $coverimage\n";
+
+    my $html = HTML::Element->new('html');
+    my $head = HTML::Element->new('head');
+
+    #
+    # Generate guide tag, specific for Mobipocket and is
+    # not understood by HTML::TreeBuilder...
+    #
+
+    
+    my $guide = HTML::Element->new('guide');
+    if ($tochref) {
+	print STDERR "Util.pm: GENERATE GUIDE SECTION: $tochref\n";
+	my $tocref = HTML::Element->new('reference', 
+					title=>"Table of Contents",
+					type=>"toc",
+					href=>"\#$tochref");
+	$guide->push_content ($tocref);
+    }
+
+    if ($config->add_cover_link ()) {
+	print STDERR "Util.pm: GENERATE GUIDE SECTION ADDCOVVERLINK\n";
+	my $coverref = HTML::Element->new('reference', 
+					  title=>"Cover",
+					  type=>"cover",
+					  href=>"\#addedcoverlink");
+	$guide->push_content ($coverref);
+    }
+    $head->push_content ($guide);
+
+    my $titleel = HTML::Element->new('title');
+    $titleel->push_content ($title);
+    $head->push_content ($titleel);
+
+    #
+    # Generate body
+    #
+
+    my $body = HTML::Element->new('body');
+
+#				  topmargin => "0",
+#				  leftmargin => "0",
+#				  bottommargin => "0",
+#				  rightmargin => "0");
+
+
+    my $coverp = HTML::Element->new('p', 
+				    id=>"addedcoverlink",
+				    align=>"center");
+    my $coverimageel = HTML::Element->new('a', 
+					  onclick => 
+					  "document.goto_page_relative(1)");
+    $coverp->push_content ($coverimageel);
+
+    if ($config->add_cover_link ()) {
+	$body->push_content ($coverp);
+	$body->push_content (HTML::Element->new('mbp:pagebreak'));
+    }
+
+#<p align="center"><a onclick="document.goto_page_relative(1)"><img src="pda_cover.gif" hisrc="pc_cover.gif" /></a></p>
+
+    #
+    # Add TOC first also if --tocfirst
+    #
+    if ($tochref and $config->toc_first ()) {
+	print STDERR "ADDING TOC FIRST ALSO: $tochref\n";
+	my $tree = new HTML::TreeBuilder ();
+	$tree->ignore_unknown (0);
+	$tree->parse_file ($tochref) || die "1-Could not find file: $tochref\n";
+###	check_for_links ($tree);
+	$linksinfo->check_for_links ($tree);
+	my $b = $tree->find ("body");
+	$body->push_content ($b->content_list());
+	$body->push_content (HTML::Element->new('mbp:pagebreak'));
+    }
+
+
+    #
+    # All files in manifest
+    #
+
+    foreach my $id (@opf_spine_ids) {
+	my $filename = $opf->get_href ($id);
+	my $mediatype = $opf->get_media_type ($id);
+
+	print STDERR "SPINE: adding $id - $filename - $mediatype\n";
+
+	next unless ($mediatype =~ /text/); # only include text content
+
+	my $tree = new HTML::TreeBuilder ();
+	$tree->ignore_unknown (0);
+
+	open FILE, "<$filename" or die "2-Could not find file: $filename\n";
+	{
+	    local $/;
+	    my $content = <FILE>;
+	    $content =~ s/&\#226;&\#8364;&\#166;/&\#8230;/g;
+	    # fixes bug in coding
+	    $tree->parse ($content);
+	    $tree->eof();
+	}
+
+	if ($config->{FIXHTMLBR}) {
+	    fix_html_br ($tree, $config);
+	}
+
+	$linksinfo->check_for_links ($tree);
+
+	print STDERR "Adding: $filename - $id\n";
+
+#	print STDERR "FILETOLINKCHECK:$filename:\n";
+	if ($linksinfo->link_exists ($filename)) {
+#	    print STDERR "FILETOLINKCHECK:$filename: SUCCESS\n";
+	    my $a = HTML::Element->new('a', name => $filename);
+	    $body->push_content ($a);
+	}
+	print STDERR "+";
+	my $b = $tree->find ("body");
+	print STDERR "+";
+	my @content = $b->content_list();
+	print STDERR "+";
+	foreach my $c (@content) {
+	    $body->push_content ($c);
+#	    print STDERR $c;
+	    print STDERR ".";
+	}
+	print STDERR "+";
+    }
+    print STDERR "All spine elements have been added\n";
+
+    if ($config->cover_image ()) {
+	$coverimage = $config->cover_image ();
+    }
+
+    if ($coverimage) {
+	copy ("../$coverimage", $coverimage); # copy if specified --coverimage
+	$linksinfo->add_cover_image ($coverimage);
+	if ($config->add_cover_link ()) {
+	    my $el = HTML::Element->new ('img', src => "$coverimage");
+	    $coverimageel->push_content ($el);
+	    $linksinfo->check_for_links ($coverimageel);
+	}
+    }
+
+    if ($config->thumb_image ()) {
+	$linksinfo->add_thumb_image ($config->thumb_image ());
+    } else {
+	if ($coverimage) {
+	    $linksinfo->add_thumb_image ($coverimage);
+	}
+    }
+
+    #
+    #  Fix anchor to positions given by id="III"...
+    #
+    # filepos="0000057579"
+    #
+
+    my @refs = $body->look_down ("href", qr/^\#/);
+    push @refs, $head->look_down ("href", qr/^\#/);
+    my @hrefs = ();
+    my @refels = ();
+    my %href_to_ref = ();
+    foreach my $r (@refs) {
+	$r->attr ("filepos", "0000000000");
+	my $key = $r->attr ("href");
+	$key =~ s/\#//g;
+	push @hrefs, $key;
+	push @refels, $r;
+#	$r->attr ("href", undef);
+    }
+
+    $html->push_content ($head);
+    $html->push_content ($body);
+    my $data = $html->as_HTML ();
+    foreach my $i (0..$#hrefs) {
+	my $h = $hrefs[$i];
+	my $r = $refels[$i];
+	my $searchfor1 = "id=\"$h\"";
+	my $searchfor2 = "<a name=\"$h\"";
+	
+###	print STDERR "SEARCHFOR1: $searchfor1\n";
+	my $pos = index ($data, $searchfor1);
+	if ($pos >= 0) {
+	    #
+	    # search backwards for <
+	    #
+	    
+	    while (substr ($data, $pos, 1) ne "<") {
+		$pos--;
+	    }
+
+##	    $pos -=4; # back 4 positions to get to <h2 id=
+	    my $form = "0" x (10-length($pos)) . "$pos";
+	    print STDERR "POSITION: $pos - $searchfor1 - $form\n";
+	    $r->attr ("filepos", "$form");
+	} else {
+###	    print STDERR "SEARCHFOR2: $searchfor2\n";
+	    $pos = index ($data, $searchfor2);
+	    if ($pos >= 0) {
+		my $form = "0" x (10-length($pos)) . "$pos";
+###		print STDERR "POSITION: $pos - $searchfor2 - $form\n";
+		$r->attr ("filepos", "$form");
+	    } else {
+	    }
+	}
+    }
+    
+
+#    my @anchors = $body->look_down ("id", qr/./);
+#    foreach my $a (@anchors) {
+#	my $name = $a->attr("id");
+#	my $tag = $a->tag ();
+#	my $text = $a->as_trimmed_text ();
+#	if ($link_exists{$name}) {
+#	    $a->delete_content ();
+#	    my $ael = HTML::Element->new('a', name => $name);
+#	    $ael->push_content ($text);
+#	    $a->push_content ($ael);
+#	}
+#	print STDERR "ANCHORS: $tag - $name - $text\n";
+#    }
+
+
+
+#    $html->push_content ($head);
+#    $html->push_content ($body);
+    return $html;
+}
+
+
+#
+# lit file functons
+#
+
+sub unpack_lit_file {
+    my $litfile = shift;
+    my $unpackdir = shift;
+
+    print STDERR "Unpack file $litfile in dir $unpackdir\n";
+
+    mkdir $unpackdir;
+
+    opendir DIR, $unpackdir;
+    my @files = readdir (DIR);
+    foreach my $f (@files) {
+	if ($f =~ /^\./) {
+	    next;
+	}
+	if ($f =~ /^\.\./) {
+	    next;
+	}
+#    print STDERR "FILE: $f\n";
+	unlink "$unpackdir/$f";
+    }
+
+    system ("clit \"$litfile\" $unpackdir") == 0
+	or die "system (clit $litfile $unpackdir) failed: $?";
+
+}
+
+sub get_thumb_cover_image_data {
+    my $filename = shift;
+##    print STDERR "COVERIMAGE: $filename\n";
+    my $data = "";
+
+    if (not -e $filename) {
+	print STDERR "Image file does not exist: $filename\n";
+	return $data;
+    }
+
+    die "ERROR: not implemented: get_thumb_cover_image_data";
+    my $p = new GD::Image ("$filename");
+    my ($x, $y) = $p->getBounds();
+#    my $x = $p->width;
+#    my $y = $p->height;
+##    add_text_to_image ($p, $opt_covertext);
+
+# pdurrant
+# Make thumb 320 high and proportional width
+# latest Mobipocket Creator makes Thumbnails 320 high
+    my $scaled = scale_gd_image ($p, 320/$y);
+    print STDERR "Resizing image $x x $y -> $x*320/$y x 320 -> scaled.jpg\n";
+
+#    my $scaled = scale_gd_image ($p, 180, 240);
+#    print STDERR "Resizing image $x x $y -> 180 x 240 -> scaled.jpg\n";
+    return $scaled->jpeg ();
+}
+
+sub scale_gd_image {
+    my $im = shift;
+    my $x = shift;
+    my $y = shift;
+    my ($w0, $h0) = $im->getBounds();
+#    my $w0 = $im->width;
+#    my $h0 = $im->height;
+    my $w1 = $w0*$x;
+    my $h1 = $h0*$x;
+    die "ERROR: not implemented: scale_gd_image";
+    print STDERR "SCALE GD: $w0 $h0 -> $w1 $h1\n";
+    if (defined $y) {
+	$w1 = $x;
+	$h1 = $y;
+    }
+    my $res = new GD::Image ($w1, $h1);
+    $res->copyResized ($im, 0, 0, 0, 0, $w1, $h1, $w0, $h0);
+    return $res;
+}
+
+
+sub get_text_image {
+    my $width = shift;
+    my $height = shift;
+    my $text = shift;
+#    my $image = Image::Magick->new;
+#    $image->Set(size=>"$width x $height");
+#    $image->ReadImage('xc:white');
+#    $image->Draw (pen => "red",
+#		  primitive => "text",
+#		  x => 200,
+#		  y => 200,
+#		  font => "Bookman-DemiItalic",
+#		  text => "QQQQ$text, 200, 200",
+#		  fill => "black",
+#		  pointsize => 40);
+#    $image->Draw(pen => 'red', fill => 'red', primitive => 'rectangle',
+#		 points => '20,20 100,100');
+#    $image->Write (filename => "draw2.jpg");
+}
+
+sub get_gd_image_data {
+    my $im = shift;
+    my $filename = shift;
+    my $quality = shift;
+
+    $quality = -1 if not defined $quality;
+
+    #
+    # For some strange reason it does not work if using
+    # the gif file with size 600x800
+    #
+
+##    if ($filename =~ /\.gif/ or $filename =~ /\.GIF/) {
+##	return $im->gif ();
+##    }
+
+    if ($quality <= 0) {
+	return $im->jpeg ();
+    } else {
+	return $im->jpeg ($quality);
+    }
+}
+
+sub add_text_to_image {
+    my $im = shift;
+    my $text = shift;
+    my $x = $im->Get ("width");
+    my $y = $im->Get ("height");
+
+    if (defined $text and $text) {
+	print STDERR "DRAW TEXT: $text\n";
+	my $textim = get_text_image ($x, $y, $text);
+	$im->Draw (primitive => "text",
+		   text => $text,
+		   points => "50,50",
+		   fill => "red",
+		   pointsize => 72);
+    }
+    $im->Write (filename => "draw.jpg");
+
+}
+
+sub get_image_data {
+    my $filename = shift;
+    my $rescale = shift;
+    my $config = shift;
+
+    die "ERROR: not implemented: scale_gd_image";
+
+    $rescale_large_images = $rescale if defined $rescale;
+
+    my $scale_factor;
+    $scale_factor = $config->scale_all_images() if defined $config;
+
+    # pdurrant
+    # make maxsize exactly 60KiB
+
+    my $maxsize = 61440;
+    $maxsize = $config->get_image_max_bytes () if defined $config;
+    #print STDERR "GET IMAGE DATA (file - maxsize): $filename - $maxsize\n";
+
+#    my $maxsize = 61000;
+    my $maxwidth = 480;
+    my $maxheight = 640;
+
+    my $data = "";
+
+    if (not -e $filename) {
+	print STDERR "Image file does not exist: $filename\n";
+	return $data;
+    }
+
+    my $filesize = -s $filename;
+    my ($x, $y, $type) = imgsize ($filename);
+
+    print STDERR "Reading data from file: $filename - $x x $y - $type\n";
+
+#    if ($filesize < $maxsize and $x < $maxwidth and $y<$maxheight
+#	and $type ne "PNG") {
+
+    # pdurrant
+    # do not resize large images if the filesize is OK, 
+    # even if pixel dimensions are large
+    if ($filesize < $maxsize and 
+	((not $rescale_large_images) || ($x <= $maxwidth and $y <= $maxheight))
+	and $type ne "PNG"
+	and (not defined $scale_factor or $scale_factor == 1.0)) {
+	
+	# No transformation has to be done, keep data as is
+	print STDERR "No transformation: $filename - $x x $y\n";
+	open(IMG, $filename) or die "can't open $filename: $!";
+	binmode(IMG);       # now DOS won't mangle binary input from GIF
+	my $buff;
+	while (read(IMG, $buff, 8 * 2**10)) {
+	    $data .= $buff;
+	}
+	return $data;
+    }
+
+
+    #die "ERROR: not implemented: get_image_data";
+    my $p = new GD::Image ("$filename");
+    if (not defined $p) {
+	my $im = new Image::BMP (file => "$filename");
+	if (defined $im) {
+	    my $w = $im->{Width};
+	    my $h = $im->{Height};
+	    print STDERR "BMP IMAGE $filename: $w x $h\n";
+	    $p = new GD::Image ($w, $h);
+	    foreach my $x (0..$w-1) {
+		foreach my $y (0..$h-1) {
+		    my ($r,$g,$b) = $im->xy_rgb ($x, $y);
+		    my $index = $p->colorExact ($r, $g, $b);
+		    if ($index == -1) {
+			$index = $p->colorAllocate ($r, $g, $b);
+		    }
+		    $p->setPixel ($x, $y, $index);
+		}
+	    }
+	}
+##	open IMAGE, ">dummy-$filename.jpg";
+##	print IMAGE $p->jpeg ();
+##	close IMAGE;
+    }
+    ($x, $y) = $p->getBounds(); # reuse of $x and $y...
+#    my $x = $p->width;
+#    my $y = $p->height;
+
+    #
+    # If I do not resize 600x800 images it does not work on Gen3
+    #
+    # check this one more time, 600x800 gif and jpeg with size
+    # less than 64K does not work on Gen3
+    #
+    # pdurrant
+    # as of July 2008, 
+    # 600x800 with size less than 61440 does work on Gen3
+    # so must use the --imagerescale argument to get 600x800.
+
+    if (defined $scale_factor and $scale_factor != 1.0) {
+	print STDERR "SCALE IMAGE: $scale_factor\n";
+	$p = MobiPerl::Util::scale_gd_image ($p, $scale_factor);
+    }
+
+    if ($rescale_large_images) {
+	my $xdiff = $x-$maxwidth;
+	my $ydiff = $y-$maxheight;
+	if ($ydiff > $xdiff) {
+	    if ($y > $maxheight) {
+		my $scale = $maxheight*1.0/$y;
+		$p = MobiPerl::Util::scale_gd_image ($p, $scale);
+	    }
+	} else {
+	    if ($x > $maxwidth) {
+		my $scale = $maxwidth*1.0/$x;
+		$p = MobiPerl::Util::scale_gd_image ($p, $scale);
+	    }
+	}
+    }
+
+    #
+    #   Scale if scale option given
+    #   or does it work just setting width?
+    #
+
+  ##  $filename =~ s/\....$/\.gif/;
+  ##  print STDERR "UTIL FILENAME: $filename\n";
+
+    my $quality = -1;
+    my $size = length (MobiPerl::Util::get_gd_image_data ($p, $filename));
+
+    if ($size > $maxsize) {
+	$quality = 100;
+	while (length (MobiPerl::Util::get_gd_image_data ($p, $filename, $quality)) >
+	       $maxsize and $quality >= 0) {
+	    $quality -= 10;
+	}
+	if ($quality < 0) {
+	    die "Could not shrink image file size for $filename";
+	}
+    } 
+
+##    if ($y < 640 and $x < 480 and defined $opt_scale) {
+##	my $scale = $opt_scale;
+##	$p = MobiPerl::Util::scale_gd_image ($p, $scale);
+##	print STDERR "Rescaling $$scale\n";
+##    }
+
+
+    $data = MobiPerl::Util::get_gd_image_data ($p, $filename, $quality);
+    return $data;
+}
+
+sub iso2hex($) {
+    my $hex = '';
+    for (my $i = 0; $i < length($_[0]); $i++) {
+	my $ordno = ord substr($_[0], $i, 1);
+	$hex .= sprintf("%lx", $ordno);
+    }
+
+    $hex =~ s/ $//;;
+    $hex = "0x$hex";
+    return $hex;
+}
+
+sub fix_html {
+    my $tree = shift;
+
+    print STDERR "FIX HTML\n";
+
+    #
+    # Fix strange HTML code
+    #
+
+    my @paras = $tree->find ("p");
+    my $inside_para = 0;
+    my $newp;
+    foreach my $p (@paras) {
+	if (not $inside_para) {
+	    $newp = HTML::Element->new("p");
+	    $inside_para = 1;
+	}
+	my $html = $p->as_HTML ();
+##	print STDERR "$html\n";
+	if ($html =~ /\&nbsp\;/) {
+##	    print STDERR $newp->as_HTML ();
+	    my $h = $newp->as_HTML ();
+##	    if ($h =~ /All three Stewards/) {
+##		last;
+##	    }
+	    $p->replace_with ($newp);
+	    $inside_para = 0;
+	    print STDERR "P";
+	} else {
+	    my @span = $p->find ("span");
+	    foreach my $span (@span) {
+		$span->replace_with ($span->content_list ());
+	    }
+	    $p->normalize_content ();
+	    $newp->push_content ($p->content_list ());
+	    $newp->push_content (" ");
+	    $p->delete ();
+	    print STDERR "+";
+	}
+    }
+}
+
+sub fix_html_br {
+    my $tree = shift;
+    my $config = shift;
+
+    print STDERR "FIX HTML BR\n";
+
+    #
+    # Fix strange HTML code with <br /><br /> instead if <p>
+    #
+
+    my $b = $tree->find ("body");
+    print STDERR "+";
+    my @content = $b->content_list();
+    print STDERR "+";
+    my @paras = ();
+    my $p = HTML::Element->new("p");
+    push @paras, $p;
+    my $i = 0;
+    while ($i <= $#content) {
+#	print STDERR "-";
+	my $c = $content[$i];
+	if ($c and ref($c) eq "HTML::Element") {
+	    my $tag = $c->tag;
+	    if ($tag eq "br" and ref($c) eq "HTML::Element" and
+		defined $content[$i+1] and ref ($content[$i+1]) and
+		$content[$i+1]->tag eq "br") {
+		$p = HTML::Element->new("p");
+		push @paras, $p;
+		if ($config->{KEEPBR}) {
+#		    $p->push_content (HTML::Element->new("br"));
+		    $p->push_content (HTML::Element->new("br"));
+		}
+		$i++;
+		if ($i % 10 == 0) {
+		    print STDERR "P";
+		}
+	    } else {
+#		print STDERR $c->as_HTML;
+		$p->push_content ($c);
+	    }
+##	    print STDERR "TAG:$tag:\n";
+	} else {
+	    if (ref($c)) {
+#		print STDERR $c->as_HTML;
+	    } else {
+#		print STDERR $c;
+	    }
+	    $p->push_content ($c);
+	}
+	$i++;
+    }
+    $b->delete_content ();
+    $b->push_content (@paras);
+}
+
+sub fix_pre_tags {
+    my $tree = shift;
+
+    print STDERR "FIX PRE TAGS\n";
+
+    my @pres = $tree->find ("pre");
+
+    foreach my $pre (@pres) {
+	print STDERR "FIX PRE TAGS: $pre\n";
+	my $p = HTML::Element->new("p", align => "left");
+
+	my @content = $pre->content_list ();
+	my $text = $content[0];
+
+
+	my @lines = split ("\n", $text);
+	foreach my $line (@lines) {
+	    my $br = HTML::Element->new("br");
+	    $line =~ s/\s/&nbsp\;/g;
+
+##	    print STDERR $line;
+	    $p->push_content ($line);
+	    $p->push_content ($br);
+	    $p->push_content ("\n");
+	}
+	$pre->replace_with ($p);
+    }
+
+}
+
+sub remove_java_script {
+    my $tree = shift;
+
+    print STDERR "REMOVE SCRIPT CODE\n";
+
+    my @scripts = $tree->find ("script");
+
+    foreach my $script (@scripts) {
+	print STDERR "REMOVING SCRIPT NODE: $script\n";
+	$script->detach ();
+    }
+}
+
+}
+
+
+package MobiPerl::Config; BEGIN { $INC{"MobiPerl/Config.pm"} = "MobiPerl/Config.pm" }
+BEGIN {
+package MobiPerl::Config;
+
+#    Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    MobiPerl/COnfig.pm, Copyright (C) 2007 Tommy Persson, tpe@ida.liu.se
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#use FindBin qw($RealBin);
+#use lib "$RealBin";
+
+use strict;
+
+sub new {
+    my $this = shift;
+    my $data = shift;
+    my $class = ref($this) || $this;
+    my $obj = bless {
+	ADDCOVERLINK => 0,
+	TOCFIRST => 0,
+	COVERIMAGE => "",
+	THUMBIMAGE => "",
+	AUTHOR => "",
+	TITLE => "",
+	PREFIXTITLE => "",
+	NOIMAGES => 0,
+	FIXHTMLBR => 0,
+	REMOVEJAVASCRIPT => 0,
+	SCALEALLIMAGES => 1.0,
+	KEEPBR => 0,
+	IMAGEMAXBYTES => 61440,
+	@_
+    }, $class;
+    $obj->initialize_from_file ($data) if defined $data;
+    return $obj;
+}
+
+sub add_cover_link {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{ADDCOVERLINK} = $val;
+    } else {
+	return $self->{ADDCOVERLINK};
+    }
+}
+
+sub toc_first {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{TOCFIRST} = $val;
+    } else {
+	return $self->{TOCFIRST};
+    }
+}
+
+sub cover_image {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{COVERIMAGE} = $val;
+    } else {
+	return $self->{COVERIMAGE};
+    }
+}
+
+sub thumb_image {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{THUMBIMAGE} = $val;
+    } else {
+	return $self->{THUMBIMAGE};
+    }
+}
+
+sub author {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{AUTHOR} = $val;
+    } else {
+	return $self->{AUTHOR};
+    }
+}
+
+sub title {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{TITLE} = $val;
+    } else {
+	return $self->{TITLE};
+    }
+}
+
+sub prefix_title {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{PREFIXTITLE} = $val;
+    } else {
+	return $self->{PREFIXTITLE};
+    }
+}
+
+sub no_images {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{NOIMAGES} = $val;
+    } else {
+	return $self->{NOIMAGES};
+    }
+}
+
+sub remove_java_script {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{REMOVEJAVASCRIPT} = $val;
+    } else {
+	return $self->{REMOVEJAVASCRIPT};
+    }
+}
+
+sub scale_all_images {
+    my $self = shift;
+    my $val = shift;
+    if (defined $val) {
+	$self->{SCALEALLIMAGES} = $val;
+    } else {
+	return $self->{SCALEALLIMAGES};
+    }
+}
+
+sub get_image_max_bytes {
+    my $self = shift;
+    return $self->{IMAGEMAXBYTES};
+}
+
+sub set_image_max_bytes {
+    my $self = shift;
+    my $val = shift;
+    $self->{IMAGEMAXBYTES} = $val;
+}
+
+}
+
+package main;
+
+#use FindBin qw($RealBin);
+#use lib "$RealBin";
+
+#
+# TODO:
+#
+# - add extended tags to existing tags, test with I, Robot
+# - perldoc, document which packages are needed
+# - add arbitrary meta information...
+# 
+
+#
+# These packages need to be installed via CPAN or via distribution
+# specific packages.
+#
+
+use Palm::PDB;
+use Palm::Doc;
+use Date::Format;  # for ctime call
+use Getopt::Mixed;
+#use Image::Size qw(imgsize);   # Used to recognize the first record that is an image
+
+#
+# The ActivePerl ppm packaged corresponding to the above is:
+#
+# p5-Palm
+# TimeDate
+# Getopt-Mixed
+# Image-Size
+#
+
+
+use MobiPerl::MobiHeader; # The MobiHeader package file is in the distribution
+use MobiPerl::Util;
+use MobiPerl::Config;
+
+use strict;
+
+use vars qw ($opt_outfile $opt_title $opt_updatedtitle 
+	     $opt_prefixtitle $opt_author $opt_addauthor 
+             $opt_publisher $opt_description $opt_language $opt_subject
+	     $opt_databasename $opt_fiximagesizes $opt_origmtime
+	     $opt_gen3imagefix
+	     $opt_addthumbnail $opt_coverimage $opt_patch $opt_coveroffset
+	     $opt_exthtype $opt_addexthtype $opt_exthdata $opt_booktype
+	     $opt_delexthtype $opt_delexthindex $opt_mbpfile $opt_savecover $opt_savethumb
+	     $opt_imagerescale
+	     $opt_allowtts $opt_deleteclippinglimit $opt_imagemaxbytes);
+
+Getopt::Mixed::getOptions ("outfile=s title=s updatedtitle=s 
+                            prefixtitle=s author=s addauthor=s
+                            description=s language=s subject=s
+                            publisher=s databasename=s patch fiximagesizes origmtime
+                            gen3imagefix
+                            exthtype=s addexthtype=s exthdata=s delexthtype=s 
+                            delexthindex=s booktype=s
+                            addthumbnail=s coverimage=s coveroffset=s
+                            mbpfile=s savecover=s savethumb=s imagerescale=s
+                            allowtts deleteclippinglimit
+                            imagemaxbytes=s
+                            ");
+
+if (not defined $opt_outfile) {
+    if (defined $opt_title or defined $opt_updatedtitle or
+	defined $opt_prefixtitle or defined $opt_author or
+	defined $opt_addauthor or defined $opt_description or
+	defined $opt_language or defined $opt_subject or
+	defined $opt_publisher or defined $opt_databasename or
+	defined $opt_patch or defined $opt_fiximagesizes or
+	defined $opt_origmtime or
+	defined $opt_gen3imagefix or defined $opt_exthtype or
+	defined $opt_addexthtype or defined $opt_exthdata or
+	defined $opt_delexthtype or defined $opt_delexthindex or
+	defined $opt_booktype or defined $opt_addthumbnail or
+	defined $opt_coverimage or defined $opt_coveroffset or
+	defined $opt_mbpfile or defined $opt_imagerescale) {
+	print STDERR "ERROR: --outfile must be specified\n";
+	exit 0;
+    }
+}
+
+my $author = "";
+my $addauthor = "";
+my $publisher = "";
+my $description = "";
+my $subject = "";
+my $title = "";
+my $updatedtitle = "";
+
+my $delexthindex = 0;
+$delexthindex = $opt_delexthindex if defined $opt_delexthindex;
+
+#
+# Read info from mbp file
+#
+
+if (defined $opt_mbpfile) {
+    open MBP, "<$opt_mbpfile" or die "Could not open $opt_mbpfile for reading: $!";
+    binmode MBP;
+    my $mbp = "";
+    {
+	undef $/;
+	$mbp = <MBP>;
+	print "LENGTH: ", length($mbp), "\n";
+    }
+    $author = get_mbp_data ("AUTH", $mbp);
+    my $cover = get_mbp_data ("COVE", $mbp);
+    my $abstract = get_mbp_data ("ABST", $mbp);
+    my $genre = get_mbp_data ("GENR", $mbp);
+    $publisher = get_mbp_data ("PUBL", $mbp);
+    $title = get_mbp_data ("TITL", $mbp);
+
+    print "Author: $author\n";
+    print "Title: $title\n";
+    print "Cover: $cover\n";
+    print "Abstract: $abstract\n";
+    print "Genre: $genre\n";
+    print "Publiser: $publisher\n";
+}
+
+$author = $opt_author if defined $opt_author;
+$addauthor = $opt_addauthor if defined $opt_addauthor;
+$title = $opt_title if defined $opt_title;
+$updatedtitle = $opt_updatedtitle if defined $opt_updatedtitle;
+$publisher = $opt_publisher if defined $opt_publisher;
+$description = $opt_description if defined $opt_description;
+$subject = $opt_subject if defined $opt_subject;
+
+
+#
+# Read mobi file
+#
+
+my $filename = shift;
+
+
+if (not $filename) {
+    print "Usage: mobi2mobi [options] filename\n";
+    print "Options: --outfile FILENAME\n";
+    print "         --title TITLE\n";
+    print "         --updatedtitle TITLE\n";
+    print "         --prefixtitle PREFIX\n";
+    print "         --author AUTHOR\n";
+    print "         --addauthor AUTHOR\n";
+    print "         --description DESCRIPTION\n";
+    print "         --subject SUBJECT\n";
+    print "         --language LANGUAGE\n";
+    print "         --publisher PUBLISHER\n";
+    print "         --databasename NAME\n";
+    print "         --patch\n";
+    print "         --origmtime\n";
+    print "         --fiximagesize\n";
+    print "         --gen3imagefix\n";
+    print "         --exthtype TYPE\n";
+    print "         --addexthtype TYPE\n";
+    print "         --exthdata DATA\n";
+    print "         --delexthtype TYPE\n";
+    print "         --delexthindex INDEX\n";
+    print "         --booktype TYPE\n";
+    print "         --addthumbnail FILENAME\n";
+    print "         --coverimage FILENAME\n";
+    print "         --coveroffset OFFSET\n";
+    print "         --mbpfile FILENAME\n";
+    print "         --savecover FILENAME\n";
+    print "         --savethumb FILENAME\n";
+    print "         --imagerescale 0|1\n";
+    print "         --imagemaxbytes n\n";
+    exit 0;
+}
+
+my $rescaleimages = $MobiPerl::Util::rescale_large_images;
+$rescaleimages = $opt_imagerescale if defined $opt_imagerescale;
+
+my $config = new MobiPerl::Config;
+$config->set_image_max_bytes ($opt_imagemaxbytes) if defined $opt_imagemaxbytes;
+
+my $pdb = new Palm::PDB;
+$pdb->Load($filename);
+
+my $name = $pdb->{"name"};
+my $version = $pdb->{"version"};
+my $type = $pdb->{"type"};
+my $creator = $pdb->{"creator"};
+my $seed = $pdb->{"uniqueIDseed"};
+my $ctime = $pdb->{"ctime"};
+my $mtime = $pdb->{"mtime"};
+my $btime = $pdb->{"baktime"};
+my $sctime = ctime ($ctime);
+my $smtime = ctime ($mtime);
+my $sbtime = ctime ($btime);
+
+print "Database Name: $name\n";
+print "      Version: $version\n";
+print "         Type: $type\n";
+print "      Creator: $creator\n";
+print "         Seed: $seed\n";
+print "        Resdb: " . $pdb->{"attributes"}{"ResDB"} . "\n";
+print " AppInfoDirty: " . $pdb->{"attributes"}{"AppInfoDirty"} . "\n";
+print "        ctime: $ctime - $sctime";
+print "        mtime: $mtime - $smtime";
+print "      baktime: $btime - $sbtime";
+print "---------------------------------------------------\n";
+
+#
+#
+#
+
+$pdb->{"name"} = $opt_databasename if defined $opt_databasename;
+
+my @records = @{$pdb->{"records"}};
+
+
+#
+# Check image sizes and warn if they are to big
+#
+
+#my $firstimageid = 0;
+#foreach my $r (@records) {
+#    my $data = $r->{"data"};
+#    my $id = $r->{"id"};
+###    print "CECKING RECORD WITH ID: $id\n";
+#    my ($x, $y) = imgsize (\$data);
+#    if (defined $x) {
+#	my $len = length ($data);
+#	if (not $firstimageid) {
+#	    print "FIRST IMG Record Id: $id\n";
+#	    $firstimageid = $id;
+#	}
+#	if ($len > 65535) {
+#	    print "ERROR:    Record $id - Image data size definitely too large: $len\n";
+#	} else {
+#	    if ($len > 61000) {
+#		print "WARNING:  Record $id - Image data size might be too large: $len\n";
+#	    }
+#	}
+##	if ($x > 480) {
+##	    print "WARNING: Record $id - Image size $x x $y might be too large due to bug in Gen3\n";
+##	}
+#    }
+#}
+print "---------------------------------------------------\n";
+
+sub detect_image($) {
+  my $head = substr($_[0], 0, 32);
+  # http://cottagedata.com/t_ebooks/part3.php
+  # .mobi supports JPEG, GIF and PNG.
+  return ($head=~/\AGIF(8[79]a)/ or
+          substr($head,0,8) eq "\211PNG\r\n\032\n" or
+          $head =~ /\A\xFF\xD8....JFIF/s) ? 1 : undef;
+}
+
+#
+# Find the first record with an image
+#
+
+my $imgindex = 0;
+my $coverimageindex = 0;
+my $thumbimageindex = 0;
+my $firstimageindex = 0;
+foreach my $r (@records) {
+    my $data = $r->{"data"};
+#    my ($x, $y) = imgsize (\$data);
+    my $x = detect_image($data);
+    if (defined $x) {
+#	print "Image record index: $imgindex ($x x $y)\n";
+	print "Image record index: $imgindex\n";
+	$firstimageindex = $imgindex;
+###	$coverimageindex = $imgindex;
+### Do not replace image since you cannot know that the image is a coverimage.
+	last;
+    }
+    $imgindex++;
+}
+print "START IMAGE INDEX: $imgindex\n";
+print "COVER IMAGE INDEX: $firstimageindex\n";
+
+my $r0 = $records[0];
+
+my $ismobi = parse_record_0 ($r0->{"data"});
+my $palmdocheader = substr ($r0->{"data"}, 0, 16);
+
+# pdurrant: these two bytes are sometimes non-zero in Aportis DOC files
+# since we're converting to Mobipocket, force to zero
+substr($palmdocheader,2,2, pack("n",0));
+
+
+my $lastid = $records[$#records]->{"id"};
+
+print "LASTID: $lastid\n";
+
+print "-----------------\n";
+
+sub get_image_data {
+    my $filename = shift;
+    my $rescale = shift;
+    my $config = shift;
+    # die "get_image_data $filename $rescale $config\n";
+    #my $data = MobiPerl::Util::get_image_data($filename, $rescale, $config);
+    #die unless open F, '>dump.img';
+    #print F $data;
+    #die unless close F;
+    die "ERROR: cannot open image: $filename: $!\n" unless open my $F, '<', $filename;
+    my $data = join('', <$F>);
+    die "ERROR: image expected in file: $filename\n" unless detect_image($data);
+    # 63 kB is the official limit.
+    die "ERROR: image too large: $filename\n" if length($data) > 61440;
+    die unless close $F;
+    $data
+}
+
+if (defined $opt_outfile) {
+    my $coveroffset = -1;
+    my $thumboffset = -1;
+
+    $coveroffset = $opt_coveroffset if defined $opt_coveroffset;
+
+    if (defined $opt_fiximagesizes) {
+	foreach my $r (@records) {
+	    my $data = $r->{"data"};
+            die "ERROR: not implemented: imgsize";
+	    my ($x, $y) = imgsize (\$data);
+	    if (defined $x) {
+                die "ERROR: not implemented: opt_fiximagesizes";
+		open IMG, ">tmpimage";
+		binmode IMG;
+		print IMG $data;
+		close IMG;
+		sleep (1); 
+# Why is this sleep needed? 
+# Without it the wrong file is usesd.
+# I there another way to ensure that the data is available?
+		$r->{"data"} = MobiPerl::Util::get_image_data ("tmpimage");
+	    }
+	}
+    }
+
+    if (defined $opt_gen3imagefix) {
+	foreach my $r (@records) {
+	    my $data = $r->{"data"};
+            die "ERROR: not implemented: imgsize";
+	    my ($x, $y, $type) = imgsize (\$data);
+#	    if (defined $x and $type eq "JPG") {
+	    if (defined $x) {
+                die "ERROR: not implemented: opt_gen3imagefix";
+##		print "GEN3 image fix $type - $x x $y, shrinking image (maybe converting to gif is better...)\n";
+		open IMG, ">tmpimage";
+		binmode IMG;
+		print IMG $data;
+		close IMG;
+		sleep (1);
+		$r->{"data"} = MobiPerl::Util::get_image_data ("tmpimage", 1);
+	    }
+	}
+    }
+
+    if (defined $opt_coverimage) {
+#	if ($coverimageindex != 0) {
+# pdurrant: Sometimes the coverimageindex in the file is -1 for no
+# cover image perl might interpret that as a large positive number, so
+# make sure we skip it.
+	if ($coverimageindex > 0 and $coverimageindex < 65535) {
+
+	    print "Setting record $coverimageindex to $opt_coverimage\n";
+	    my $data = "";
+	    #
+            # Alaway rescale since the bug seems to be in Gen 3
+	    #
+	    $data = get_image_data ($opt_coverimage, 
+					           $rescaleimages, $config);
+#	    if ($ismobi) { # only rescale if not a mobi file
+#		$data = MobiPerl::Util::get_image_data ($opt_coverimage, 0);
+#	    } else {
+#		$data = MobiPerl::Util::get_image_data ($opt_coverimage, 1);
+#	    }
+
+	    $pdb->{"records"}->[$coverimageindex]->{"data"} = $data;
+	    $coveroffset = $coverimageindex-$imgindex;
+	} else {
+	    my $img = Palm::PDB->new_Record();
+	    $img->{"categori"} = 0;
+	    $img->{"attributes"}{"Dirty"} = 1;
+	    $lastid++;
+	    print "CREATING COVER IMAGE WITH ID: $lastid\n";
+	    $img->{"id"} = $lastid;
+	    my $data = get_image_data ($opt_coverimage, 
+						       $rescaleimages, 
+						       $config);
+	    $img->{"data"} = $data;
+	    $pdb->append_Record ($img);
+	    my @records = @{$pdb->{"records"}};
+	    my $coverindex = $#records;
+	    $coveroffset = $coverindex-$imgindex;
+# pdurrant: if there are no images in the file yet, note that the cover image is first
+	    if ($firstimageindex == 0) {
+	    	$firstimageindex = $coverindex;
+	    }
+	    print "CREATING COVER IMAGE WITH COVEROFFSET: $coveroffset\n";
+	}
+    }
+
+    if (defined $opt_addthumbnail) {
+#	if ($thumbimageindex != 0) {
+
+# pdurrant: Sometimes the thumbimageindex in the file is -1 for no
+# thumb image perl might interpret that as a large positive number, so
+# make sure we skip it.
+
+	if ($thumbimageindex >0 && $thumbimageindex < 65535) {
+
+
+	    print "Setting record $thumbimageindex to $opt_addthumbnail\n";
+	    my $data = MobiPerl::Util::get_thumb_cover_image_data ($opt_addthumbnail);
+	    $pdb->{"records"}->[$thumbimageindex]->{"data"} = $data;
+	    $thumboffset = $thumbimageindex-$imgindex;
+	} else {
+	    my $img = Palm::PDB->new_Record();
+	    $img->{"categori"} = 0;
+	    $img->{"attributes"}{"Dirty"} = 1;
+	    $lastid++;
+	    $img->{"id"} = $lastid;
+	    my $data = MobiPerl::Util::get_thumb_cover_image_data ($opt_addthumbnail);
+	    $img->{"data"} = $data;
+	    $pdb->append_Record ($img);
+	    my @records = @{$pdb->{"records"}};
+	    my $thumbindex = $#records;
+	    $thumboffset = $thumbindex-$imgindex;
+# if there are no images in the file yet, note that the thumb image is first
+	    if ($firstimageindex == 0) {
+	    	$firstimageindex = $thumbindex;
+	    }
+	    print "CREATING THUMBNAIL IMAGE WITH THUMBNAILOFFSET: $thumboffset\n";
+	}
+    }
+
+    if ($ismobi) {
+	my $mh = substr ($r0->{"data"}, 16);
+
+	if ($author) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "author", $author);
+	}
+	if ($addauthor) {
+	    $mh = MobiPerl::MobiHeader::add_exth_data ($mh, "author", $addauthor);
+	}
+	if ($publisher) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "publisher", $publisher);
+	}
+	if ($description) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "description", $description);
+	}
+	if ($subject) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "subject", $subject);
+	}
+	if ($title) {
+	    print "Setting new title: $title\n";
+	    $mh = MobiPerl::MobiHeader::set_extended_title ($mh, $title);
+	}
+
+	if ($updatedtitle) {
+	    print "Setting new updated title: $updatedtitle\n";
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "updatedtitle", 
+						       $updatedtitle);
+	}
+
+	if (defined $opt_booktype) {
+	    print "Setting new booktype: $opt_booktype\n";
+	    $mh = MobiPerl::MobiHeader::set_booktype ($mh, $opt_booktype);
+	}
+
+	if (defined $opt_language) {
+	    print "Setting new language: $opt_language\n";
+	    $mh = MobiPerl::MobiHeader::set_language_in_header ($mh, $opt_language);
+	}
+
+	if (defined $opt_prefixtitle) {
+	    my $t = MobiPerl::MobiHeader::get_extended_title ($mh);
+	    $t = $opt_prefixtitle . $t;
+	    print "Setting new title: $t\n";
+	    $mh = MobiPerl::MobiHeader::set_extended_title ($mh, $t);
+	}
+	if (defined $opt_patch) {
+	    my ($imgflg, $imgindex) = unpack ("nn", substr ($mh, 0xb0));
+	    my $newimgindex = $imgindex;
+	    print "PATCHING IMGINDEX $imgindex -> $newimgindex\n";
+	    substr ($mh, 0xb0, 4, pack ("nn", 0, $newimgindex));
+	}
+	$mh = MobiPerl::MobiHeader::set_exth_data ($mh, "thumboffset", $thumboffset) if ($thumboffset >= 0);
+	$mh = MobiPerl::MobiHeader::set_exth_data ($mh, "coveroffset", $coveroffset) if ($coveroffset >= 0);
+
+	if (defined $opt_exthtype and defined $opt_exthdata) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "$opt_exthtype", $opt_exthdata);
+	}
+
+	if (defined $opt_addexthtype and defined $opt_exthdata) {
+	    $mh = MobiPerl::MobiHeader::add_exth_data ($mh, "$opt_addexthtype", $opt_exthdata);
+	}
+
+	if (defined $opt_delexthtype) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "$opt_delexthtype", undef, 0, $delexthindex);
+	}
+
+	if (defined $opt_allowtts) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "ttsflag", undef, 0, 0);
+	}
+
+	if (defined $opt_deleteclippinglimit) {
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "clippinglimit", undef, 0, 0);
+	}
+	
+# pdurrant: if we know the first image index, note it in the mobi header
+# The CyBook Gen3 uses this as the base for offsets
+	if ($firstimageindex > 0) {
+		substr ($mh, 0x5c, 4, pack ("N", $firstimageindex));
+	}
+
+	$r0->{"data"} = $palmdocheader . $mh;
+    } else {
+	my $mh = new MobiPerl::MobiHeader;
+
+	my $t = $filename;
+	$t =~ s/\.prc$//;
+	$t =~ s/\.pdb$//;
+	$t =~ s/\.mobi$//;
+
+	# remove directory paths from name
+
+	$t =~ s!^.*/!!;
+
+	$t = $title if $title;
+	$t = $opt_prefixtitle . $t if defined $opt_prefixtitle;
+
+	print STDERR "WARNING: Add author do not work for books without EXTH headers, convert to a proper MobiPocket file first\n" 
+	    if $addauthor;
+
+	$mh->set_title ($t);
+	$mh->set_author ($author) if $author;
+	$mh->set_publisher ($publisher) if $publisher;
+	$mh->set_description ($description) if $description;
+	$mh->set_subject ($subject) if $subject;
+	$mh->set_language ($opt_language) if $opt_language;
+#	$mh->set_image_record_index ($imgindex);
+# pdurrant: if we know the first image index, note it in the mobi header
+# The CyBook Gen3 uses this as the base for offsets
+	if ($firstimageindex > 0) {
+		$mh->set_image_record_index ($firstimageindex);
+	}
+
+	$mh->set_thumb_offset ($thumboffset) if ($thumboffset >= 0);
+	$mh->set_cover_offset ($coveroffset) if ($coveroffset >= 0);
+
+	$pdb->{"type"} = "BOOK";
+	$pdb->{"creator"} = "MOBI";
+	
+	$r0->{"data"} = $palmdocheader . $mh->get_data ();
+    }
+
+
+    $pdb->{mtime} = $pdb->{orig_mtime};  # !! command-line flag.
+    $pdb->Write ($opt_outfile);
+    print ".mobi output file written: $opt_outfile\n";
+}
+
+
+sub parse_record_0 {
+    my $rec = shift;
+    my $res = 0;
+    my $palmdocheader = substr ($rec, 0, 16);
+    parse_palmdoc_header ($palmdocheader);
+    if ($type eq "BOOK" and $creator eq "MOBI") {
+	my $mobiheader = substr ($rec, 16);
+	parse_mobi_header ($mobiheader);
+	$res = 1;
+    }
+    return $res;
+}
+
+
+sub parse_palmdoc_header {
+    my $data = shift;
+    my ($version, $length, $nrecords, $recsize, $unknown) =
+	unpack ("nxxNnnN", $data);
+    print "PDHEADER  Version: $version\n";
+    print "PDHEADER   Length: $length\n";
+    print "PDHEADER NRecords: $nrecords\n";
+    print "PDHEADER  Recsize: $recsize\n";
+    print "PDHEADER  Unknown: $unknown\n";
+}
+
+sub parse_mobi_header {
+    my $data = shift;
+    my ($doctype, $length, $type, $codepage, $uniqueid, $ver) =
+	unpack ("a4NNNNN", $data);
+    my ($exthflg) = unpack ("N", substr ($data, 0x70));
+
+    if ($ver > 3) {
+	my ($ciflg, $ciptr) = unpack ("nn", substr ($data, 0xb0));
+	print "MOBIHEADER    ciflg: $ciflg\n";
+	print "MOBIHEADER    ciptr: $ciptr\n";
+    }
+
+    my $extradataflag = unpack ("n", substr ($data, 242-16));
+
+    my $langcode = MobiPerl::MobiHeader::get_mh_language_code ($data);
+    my $lid = $langcode & 0xFF;
+    my $sublid = ($langcode >> 10) & 0xFF;
+
+    my $typedesc = MobiPerl::MobiHeader::get_booktype_desc ($type);
+    my $langdesc = MobiPerl::MobiHeader::get_language_desc ($langcode);
+
+    print "MOBIHEADER  doctype: $doctype\n";
+    print "MOBIHEADER   length: $length\n";
+    print "MOBIHEADER booktype: $type - $typedesc\n";
+    print "MOBIHEADER    codep: $codepage\n";
+    print "MOBIHEADER   uniqid: $uniqueid\n";
+    print "MOBIHEADER      ver: $ver\n";
+    print "MOBIHEADER  exthflg: $exthflg\n";
+    print "MOBIHEADER language: $langcode - $lid - $sublid - $langdesc\n";
+    print "MOBIHEADER xtradata: $extradataflag ", MobiPerl::Util::iso2hex ($extradataflag), "\n";
+
+    if ($exthflg & 0x40) {
+	my $exth = substr ($data, $length);
+
+	my $eh = new MobiPerl::EXTH ($exth);
+	my $cover_offset = $eh->get_cover_offset ();
+	print "COVEROFFSET: $cover_offset\n";
+	my $thumb_offset = $eh->get_thumb_offset ();
+	print "THUMBOFFSET: $thumb_offset\n";
+
+#	if ($cover_offset) {
+# pdurrant: 0 is a valid cover_offset
+	if ($cover_offset >= 0) {
+	    $coverimageindex = $imgindex + $cover_offset;
+	}
+#	if ($thumb_offset) {
+# pdurrant: 0 is a valid thumb_offset
+	if ($thumb_offset >= 0) {
+	    $thumbimageindex = $imgindex + $thumb_offset;
+	}
+
+	if (defined $opt_savecover) {
+	    if ($cover_offset != 0) {
+		my $filename = $opt_savecover;
+		my $r = $records[$coverimageindex];
+		my $data = $r->{"data"};
+                die "ERROR: not implemented: opts_savecover";
+		my ($x, $y, $type) = imgsize(\$data);
+		if (not $filename =~ /\./) {
+		    $filename .= "." . lc ($type);
+		}
+		if (defined $x) {
+		    print "Saving cover image $x x $y: $filename\n";
+		    if (open DATA, ">$filename") {
+			binmode (DATA);
+			print DATA $data;
+			close DATA;
+		    } else {
+			print "Could not save cover: $!";
+		    }
+		} else {
+		    print STDERR "ERROR: Data at cover offset is not an image\n";
+		}
+	    } else {
+		print STDERR "ERROR: No cover image in book\n";
+	    }
+	}
+
+	if (defined $opt_savethumb) {
+	    if ($thumb_offset != 0) {
+		my $filename = $opt_savethumb;
+		my $r = $records[$thumbimageindex];
+		my $data = $r->{"data"};
+                die "ERROR: not implemented: opts_savethumb";
+		my ($x, $y, $type) = imgsize(\$data);
+		if (not $filename =~ /\./) {
+		    $filename .= "." . lc ($type);
+		}
+		if (defined $x) {
+		    print "Saving cover image $x x $y: $filename\n";
+		    if (open DATA, ">$filename") {
+			binmode (DATA);
+			print DATA $data;
+			close DATA;
+		    } else {
+			print STDERR "Could not save thumb: $!";
+		    }
+		} else {
+		    print STDERR "ERROR: Data at thumb offset is not an image\n";
+		}
+	    } else {
+		print STDERR "ERROR: No thumb image in book\n";
+	    }
+	}
+
+	parse_mobi_exth ($exth);
+    }
+    my $title = MobiPerl::MobiHeader::get_extended_title ($data);
+    print "LONGTITLE: $title\n";
+}
+
+sub parse_mobi_exth {
+    my $data = shift;
+    my ($doctype, $len, $n_items) = unpack ("a4NN", $data);
+    print "EXTH doctype: $doctype\n";
+    print "EXTH  length: $len\n";
+    print "EXTH n_items: $n_items\n";
+    my $pos = 12;
+    foreach (1..$n_items) {
+	my ($id, $size) = unpack ("NN", substr ($data, $pos));
+	$pos += 8;
+	my $contlen = $size-8;
+	my ($content) = unpack ("a$contlen", substr ($data, $pos));
+	my $hid = sprintf ("%x", $id);
+	my $hsize = sprintf ("%x", $size);
+	my $desc = MobiPerl::EXTH::get_description ($id);
+	if (MobiPerl::EXTH::is_binary_data ($id)) {
+	    $content = MobiPerl::Util::iso2hex ($content);
+	}
+	print "EXTH    item: $id - $desc - $contlen - $content\n";
+	$pos += $contlen;
+    }
+}
+
+
+sub get_mbp_data {
+    my $key = shift;
+    my $data = shift;
+    my $res = "";
+    my $d = (split /$key/, $data)[-1];
+    if ($d and $d ne $data) {
+	my ($len) = unpack ("N", $d);
+	($len, $res) = unpack ("Na$len", $d);
+	# Looks like it. Longman mbp abstract has 2013, which is en dash in UTF-16.
+	$res =~ s/\0//g; # coding is probably UTF-16
+    }
+    return $res;
+}
+
+
+=pod
+
+=head1 NAME
+
+mobi2mobi - A program to manipulate mobi files
+
+=head1 SYNOPSIS
+
+mobi2mobi file.mobi
+
+mobi2mobi file.prc
+
+mobi2mobi --outfile out.mobi --prefixtitle "01-" file.mobi
+
+=head1 DESCRIPTION
+
+A program to manipulate MobiPocket files. Author and title can be set
+and a cover image (also thumb nail image for Gen3) can be added.
+
+There are two kind of prc files used for electronic books. One is a
+PalmDOC file which does not have a MOBI header but can contain HTML
+code marked up with MobiPocket specific markup and it can be read by a
+MobiPocket reader. For this format you cannot store meta information
+in the header. The other format is MobiPocket and it has a MOBI header
+and some additional data where you can store meta information and an
+extended title.
+
+This program can change the extended title for a MobiPocket file. It
+can also automatically convert a PalmDOC file to a MobiPocket file and
+set the title.
+
+It can also add author information to a PalmDOC file by converting it
+to a MobiPocket file and set the author meta information. It can also
+change or set the author information for a MobiPocket file.
+
+You can also add a prefix to a title in a MobiPocket file. This does
+not work for PalmDOC files.
+
+It is possible to add an image to the file. If there are no other
+images in the file then the added image will be used as cover image
+and thumb nail image for Cybook Gen3. You can also replace the cover
+image if it already exists.
+
+Just running the program on a mobifile without any flags will print
+some information about the file.
+
+Since there is no specification available for the MOBI header this
+program might generate books that are not entirely correct. So keep the
+original files...
+
+Authors, titles etc. are accepted in UTF-8 no matter the system locale.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--databasename NAME>
+
+Change the internal database name of the file (the first 31 characters
+in the file). This may be useful in conjunction with the oeb:redirect
+tag when creating mobi-format ebooks.
+
+=item B<--mbpfile FILE>
+
+Use the author and publisher info in the mbp file and set these in the
+outfile. --author and --publisher overrides this information.
+
+=item B<--title TITLE>
+
+Change the the title of the book.
+
+=item B<--prefixtitle prefix>
+
+Add a prefix to the title of the book.
+
+=item B<--author AUTHOR>
+
+Set the author of the book.
+
+=item B<--addauthor AUTHOR>
+
+Add another author of the book.
+
+=item B<--publisher PUBLISHER>
+
+Set the publisher of the book.
+
+=item B<--description DESCRIPTION>
+
+Set the description of the book.
+
+=item B<--subject SUBJECT>
+
+Set the subject of the book. Can currently only set one subject.
+
+=item B<--language LANGUAGE>
+
+Set the language of the book. LANGUAGE should be a string like "en-gb"
+or a number like 2057.
+
+=item B<--addthumbnail IMAGEFILE>
+
+Add an image that will be used as thumbnail image. If there already is
+a thumb nail image it will be replaced.  The only way for it to be a
+thumb nail image is if the thumb offset is specified in the EXTH data.
+
+=item B<--coverimage IMAGEFILE>
+
+Set the cover image of a book. If there already is a cover image it will
+be replaced. The only way for it to be a cover image is if the cover offset is
+specified in the EXTH data.
+
+=item B<--savecover FILENAME>
+
+Save the cover image if it exists. If filename is given without
+extension the correct extension will be added.
+
+=item B<--savethumb FILENAME>
+
+Save the thumb nail image if it exists. If filename is given without
+extension the correct extension will be added.
+
+=item B<--fiximagesizes>
+
+Fix image sizes so that they are less then 61000 bytes and rescale
+so they work on the Gen3.
+
+=item B<--origmtime>
+
+Copy the original last-modification time (mtime) of the input file
+to the output file.
+
+=item B<--gen3imagefix>
+
+Fix image sizes so that they are less then 61000 bytes and rescale
+so they work on the Gen3.
+
+=item B<--coveroffset OFFSET>
+
+Change the offset of the cover image so it points to another image.
+
+=item B<--exthtype TYPE>
+
+The type of the EXTH item you want to change. This is the name of the
+type and the names can be found in MobiPerl/EXTH.pm.
+
+=item B<--addexthtype TYPE>
+
+Add another EXTH entry. TYPE is the name of the type and the names can
+be found in MobiPerl/EXTH.pm.
+
+=item B<--delexthtype TYPE>
+
+Delete all entries in EXTH with type TYPE. TYPE is the name of the
+type and the names can be found in MobiPerl/EXTH.pm.
+
+=item B<--delexthindex INDEX>
+
+Specify that --delexthtype should not delete all items of the type
+TYPE but just delete the first one if INDEX is 1 and the second one if
+INDEX is 2 and so on.
+
+=item B<--exthdata TYPE>
+
+The data of the EXTH item you want to change.
+
+=item B<--outfile FILENAME>
+
+Specifies an output file. Only when this flag is given is any
+conversion done.
+
+=item B<--imagerescale 0|1>
+
+Default is rescaling images for them to work on Cybook Gen3. To
+disable this specify --imagerescale 0.
+
+=item B<--allowtts>
+
+Allow text to speech to be used (for Kindle books).
+
+=item B<--deleteclippinglimit>
+
+Remove the clipping limit (for Kindle books).
+
+=back
+
+=head1 EXAMPLES
+
+   mobi2mobi file.mobi
+
+   mobi2mobi --outfile out.mobi --prefixtitle "01-" file.mobi
+
+   mobi2mobi --outfile out.mobi --title "Correction of title" file.mobi
+
+   mobi2mobi --addthumbnail cover.jpg --outfile out.mobi file.mobi
+
+
+=head1 TODO
+
+   - Functionality to change or add other meta information then author.
+
+=head1 BUGS
+
+   - according to the Mobilread thread there is some problem with DRM:ed 
+     files...
+
+
+=head1 AUTHOR
+
+Tommy Persson (tpe@ida.liu.se)
+
+=cut
+
+
+
+
