@@ -5406,14 +5406,21 @@ if (defined $opt_fromopf) {
   die "ERROR: metadata.opf not an XML: $opt_fromopf\n" unless $data =~ m@<?xml\s@;
   die "ERROR: metadata.opf not an UTF-8 XML: $opt_fromopf\n" unless $data =~ m@<?xml\s+[^>].*?\bencoding=["'](?i)utf-8['"]@s;
 
+  # TODO(pts): Add an option to remove the cover.
   my $opf_coverimage;
   while ($data =~ m@<reference href="([^"<>]*)" type="cover"@g) {
     die "ERROR: metadata.opf has duplicate cover image: $opt_fromopf\n" if defined $opf_coverimage;
     $opf_coverimage = $1;
   }
-  $opf_coverimage = htmldecode_utf8($opf_coverimage);
-  $opf_coverimage = substr($filename, 0, rindex($filename, '/') + 1) . $opf_coverimage if
-      $opf_coverimage !~ m@\A/@ and index($filename, '/') >= 0;
+  if (defined $opf_coverimage) {
+    $opf_coverimage = htmldecode_utf8($opf_coverimage);
+    $opf_coverimage = substr($filename, 0, rindex($filename, '/') + 1) . $opf_coverimage if
+        $opf_coverimage !~ m@\A/@ and index($filename, '/') >= 0;
+    if (!-f $opf_coverimage) {
+      print STDERR "WARNING: metadata.opf refers to nonexisting cover image: $opt_fromopf\n";
+      undef $opf_coverimage;
+    }
+  }
 
   my $opf_author;
   while ($data =~ m@<dc:creator(?=\s)[^<>]*?\s+opf:role="aut">([^<]*)<@g) {
@@ -5530,6 +5537,7 @@ my @records = @{$pdb->{"records"}};
 
 my $file_author = '';  # TODO(pts): Support several author fields.
 my $file_title = '';
+my $file_updatedtitle = '';
 
 
 #
@@ -5781,6 +5789,8 @@ if (defined $opt_outfile) {
 	    $do_save = 1 if $file_title ne $title;
 	    print "Setting new title: $title\n";
 	    $mh = MobiPerl::MobiHeader::set_extended_title ($mh, $title);
+	    $do_save = 1 if $file_updatedtitle ne $title;
+	    $mh = MobiPerl::MobiHeader::set_exth_data ($mh, "updatedtitle", $title);
 	}
 
 	if ($updatedtitle) {
@@ -6060,6 +6070,7 @@ sub parse_mobi_exth {
 	}
 	print "EXTH    item: $id - $desc - $contlen - $content\n";
 	$file_author = $content if $desc eq 'Author' and !length($file_author);
+	$file_updatedtitle = $content if $desc eq 'UpdatedTitle' and !length($file_updatedtitle);
 	$pos += $contlen;
     }
 }
