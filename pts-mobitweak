@@ -5576,7 +5576,9 @@ sub detect_image($) {
   # .mobi supports JPEG, GIF and PNG.
   return ($head=~/\AGIF(8[79]a)/ or
           substr($head,0,8) eq "\211PNG\r\n\032\n" or
-          $head =~ /\A\xFF\xD8....JFIF/s) ? 1 : undef;
+          $head =~ /\A\xFF\xD8....JFIF/s or
+          $head =~ /\A\xFF\xD8....Exif/s  # TODO(pts): Remove the Exif header.
+         ) ? 1 : undef;
 }
 
 #
