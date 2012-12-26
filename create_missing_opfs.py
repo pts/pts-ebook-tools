@@ -73,11 +73,15 @@ def main(argv):
   for i, opf_path in book_opf_items:
     mi = db.get_metadata(i, index_is_id=True)
     print >>sys.stderr, 'info: Creating metadata.opf: %s' % opf_path
-    opf_creator = opf2.OPFCreator(os.path.dirname(opf_path), mi)
-    sio = cStringIO.StringIO()
-    opf_creator.render(sio)
+    # This creates a very different .opf.
+    #   opf_creator = opf2.OPFCreator(os.path.dirname(opf_path), mi)
+    #   sio = cStringIO.StringIO()
+    #   opf_creator.render(sio)
+    if mi.has_cover and not mi.cover:
+      mi.cover = 'cover.jpg'
+    data = opf2.metadata_to_opf(mi)
     with open(opf_path, 'wb') as f:
-      f.write(sio.getvalue())
+      f.write(data)
   print >>sys.stderr, 'info: metadata.opf creation done.'
 
 
