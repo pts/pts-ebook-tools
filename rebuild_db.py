@@ -39,8 +39,10 @@ def encode_unicode(data):
       raise AssertionError('Uknown character in %r. Please set up system '
                            'locale properly, or use ASCII only.' % data)
     return data.encode(calibre.preferred_encoding)
+  elif data is None:
+    return data
   else:
-    raise TypeError
+    raise TypeError(type(data))
 
 
 SQLITE_KEYWORDS = frozenset((
@@ -269,7 +271,11 @@ def get_extensions(builtins_module):
     class_obj = getattr(builtins_module, name)
     if type(class_obj) == type(mrp) and issubclass(class_obj, mrp):
       for extension in class_obj.file_types:
-        extensions.add(extension.lower())
+        extensions.add(extension.lower().lstrip('.'))
+  for extension in extensions:
+    if '.' in extensions:
+      raise AssertionError(repr(extension))
+  extensions.discard('opf')
   # Example: 'rtf', 'prc', 'azw1', 'odt', 'cbr', 'pml', 'rar', 'cbz', 'snb',
   # 'htmlz', 'txt', 'updb', 'zip', 'oebzip', 'chm', 'lit', 'imp', 'html',
   # 'rb', 'fb2', 'docx', 'azw3', 'azw4', 'txtz', 'lrf', 'tpz', 'opf', 'lrx',
@@ -278,6 +284,18 @@ def get_extensions(builtins_module):
 
 
 EXTENSIONS = frozenset(get_extensions(builtins))
+
+
+def new_id(ids, row_obj):
+  id_int = ids[type(row_obj)] + 1
+  ids[type(row_obj)] = id_int
+  row_obj.id = id_int
+
+
+def create_insert_sql(row_class):
+  return 'INSERT INTO %s VALUES (%s)' % (
+      escape_sqlite_name(row_class.table_name),
+      ','.join(['?'] * len(row_class.__slots__)))
 
 
 def main(argv):
@@ -353,6 +371,7 @@ def main(argv):
     if fields != row_class.__slots__:
       raise RuntimeError('Unexpected fields in table %s: expected=%r got=%r' %
                          (row_class.table_name, row_class.__slots__, fields))
+  c.execute('BEGIN EXCLUSIVE')  # Locks the file immediately.
 
   # Copy the non-book tables.
   for table in tables_to_copy:
@@ -380,33 +399,114 @@ def main(argv):
       c.execute(sql, row)
 
   # Generate metadata.opf (in memory) if missing.
-  inmemory_opfs = {}
+  opfs = {}
+  dotexts = sorted('.' + extension for extension in EXTENSIONS)
+  if '.opf' in dotexts:
+    raise AssertionError
   for row in dc.execute('SELECT path, id FROM books'):
     opf_dir = os.path.join(dbdir, row[0].replace('/', os.sep))
-    if opf_dir in inmemory_opfs:
+    if opf_dir in opfs:
       raise AssertionError
     if not os.path.exists(os.path.join(opf_dir, 'metadata.opf')):
-      inmemory_opfs[opf_dir] = row[1]
-  if inmemory_opfs:
+      opfs[opf_dir] = row[1]
+  if opfs:
     print >>sys.stderr, (
-        'info: Computing in-memory metadata.opf for %s book%s.' %
-        (len(inmemory_opfs), 's' * (len(inmemory_opfs) != 1)))
+        'info: Computing in-memory metadata.opf for %d book%s.' %
+        (len(opfs), 's' * (len(opfs) != 1)))
     db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
-    for i, opf_dir in sorted((b, a) for a, b in inmemory_opfs.iteritems()):
+    for i, opf_dir in sorted((b, a) for a, b in opfs.iteritems()):
       # TODO(pts): Why does this work if this process already holds an
       # EXCLUSIVE lock on metadata.db?
       mi = db.get_metadata(i, index_is_id=True)
       if mi.has_cover and not mi.cover:
         mi.cover = 'cover.jpg'
-      inmemory_opfs[opf_dir] = opf2.metadata_to_opf(mi)
-
-      mi2 = opf2.OPF(cStringIO.StringIO(inmemory_opfs[opf_dir])).to_book_metadata()
-      print mi2
-      print sorted(dir(mi2))
-      print mi2._data
+      opf_data = opf2.metadata_to_opf(mi)
+      # TODO(pts): Ignore books with wrong name:
+      #   ebook-hu-mate/Thomas\ Mann/Kiralyi\ fenseg\ \(42\)/
+      #   Francois Villon balladai - Francois Villon.mobi
+      #   Kiralyi fenseg - Thomas Mann.epub
+      #   Kiralyi fenseg - Thomas Mann.mobi
+      filenames = sorted(
+          filename for filename in os.listdir(opf_dir) if
+          os.path.isfile(os.path.join(opf_dir, filename)) and
+          filename != 'cover.jpg' and
+          any(1 for dotext in dotexts if filename.endswith(dotext)))
+      opfs[opf_dir] = (opf_data, filenames)
+      del opf_data, filenames
     del db
   else:
-    print >>sys.stderr, 'Found metadata.opf for all books in metadata.db.'
+    print >>sys.stderr, 'info: Found metadata.opf for all books in metadata.db.'
+
+  # Read all .opf files.
+  print >>sys.stderr, 'info: Reading metadata.opf files.'
+  for dirpath, dirnames, filenames in os.walk(dbdir):
+    if 'metadata.opf' in filenames and dirpath != dbdir:
+      if dirpath in opfs:
+        raise AssertionError('Book directory already defined: %r' % dirpath)
+      opf_data = open(os.path.join(dirpath, 'metadata.opf')).read()
+      filenames = sorted(
+          filename for filename in filenames if
+          filename != 'cover.jpg' and
+          any(1 for dotext in dotexts if filename.endswith(dotext)))
+      opfs[dirpath] = (opf_data, filenames)
+      del opf_data, filenames
+
+  # Parse .opf files.
+  # TODO(pts): If this is slow, redesign this tool.
+  # TODO(pts): What if just making a few books dirty, and let calibre reread.
+  print >>sys.stderr, 'info: Parsing %d metadata.opf file%s.' % (
+      len(opfs), 's' * (len(opfs) != 1))
+  for opf_dir in sorted(opfs):
+    opf_data, filenames = opfs[opf_dir]
+    opfs[opf_dir] = (opf2.OPF(cStringIO.StringIO(opf_data)).to_book_metadata(),
+                     filenames)
+
+  # Add books to the new database.
+  # TODO(pts): Split this function.
+  print >>sys.stderr, 'info: Adding books to the new database.'
+  ids = {
+      BooksRow: 0,
+  }
+  books_sql = create_insert_sql(BooksRow)
+  for opf_dir in sorted(opfs):
+    # `mi' contains strings as unicode.
+    mi, filenames = opfs[opf_dir]
+    #print mi._data
+    books_row = BooksRow()
+    # TODO(pts): Try to preserve the calibre-id (not available in mi).
+    new_id(ids, books_row)
+    if mi.title_sort is None:
+      raise AssertionError
+    books_row.title = encode_unicode(mi.title) or '?'
+    books_row.sort = encode_unicode(mi.title_sort)
+    books_row.timestamp = mi.timestamp
+    books_row.pubdate = mi.pubdate
+    if mi.series_index is None:
+      books_row.series_index = 1.0
+    else:
+      # TODO(pts): Test this.
+      books_row.series_index = float(mi.series_index)
+    if mi.author_sort is None:
+      raise AssertionError
+    books_row.author_sort = encode_unicode(mi.author_sort)
+    books_row.isbn = encode_unicode(mi.isbn)
+    books_row.lccn = None  # Calibre doesn't seem to use this field.
+    books_row.path = opf_dir.replace('/', os.sep)
+    books_row.flags = 1  # Calibre doesn't seem to use this field.
+    books_row.uuid = encode_unicode(mi.uuid)
+    books_row.has_cover = False
+    for guide in mi.guide or ():
+      if getattr(guide, 'type', None) == 'cover':
+        books_row.has_cover = True
+        break
+    books_row.last_modified = mi.last_modified  # Usually None.
+    if books_row.last_modified is None:
+      # This information is missing from the .opf file.
+      # TODO(pts): Get it from the mtime of the .opf file? git doesn't preserve
+      # it in the working copy, but maybe we could get it.
+      books_row.last_modified = '2000-01-01 00:00:00+00:00'
+    c.execute(books_sql, [
+        getattr(books_row, name) for name in books_row.__slots__])
 
   # Add functions and aggregates needed by the indexes, views and triggers
   # below.
