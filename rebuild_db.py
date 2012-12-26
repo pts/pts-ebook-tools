@@ -430,6 +430,7 @@ def main(argv):
   dotexts = sorted('.' + extension for extension in EXTENSIONS)
   if '.opf' in dotexts:
     raise AssertionError
+  incorrect_file_count = 0
   for row in dc.execute('SELECT path, id FROM books'):
     opf_dir = os.path.join(dbdir, row[0].replace('/', os.sep))
     if opf_dir in opfs:
@@ -453,13 +454,17 @@ def main(argv):
       #   Francois Villon balladai - Francois Villon.mobi
       #   Kiralyi fenseg - Thomas Mann.epub
       #   Kiralyi fenseg - Thomas Mann.mobi
-      filenames = sorted(
-          (filename, os.stat(os.path.join(opf_dir, filename)).st_size)
-          for filename in os.listdir(opf_dir) if
-          os.path.isfile(os.path.join(opf_dir, filename)) and
-          filename != 'cover.jpg' and
-          any(1 for dotext in dotexts if filename.endswith(dotext)) and
-          is_correct_book_filename(filename, opf_dir))
+      filenames = []
+      for filename in os.listdir(opf_dir):
+        if (os.path.isfile(os.path.join(opf_dir, filename)) and
+            filename != 'cover.jpg' and
+            any(1 for dotext in dotexts if filename.endswith(dotext))):
+          if is_correct_book_filename(filename, opf_dir):
+            filenames.append(
+                (filename, os.stat(os.path.join(opf_dir, filename)).st_size))
+          else:
+            incorrect_file_count += 1
+      filenames.sort()
       opfs[opf_dir] = (opf_data, filenames)
       del opf_data, filenames
     del db
@@ -468,23 +473,26 @@ def main(argv):
 
   # Read all .opf files.
   print >>sys.stderr, 'info: Reading metadata.opf files.'
-  for dirpath, dirnames, filenames in os.walk(dbdir):
-    if 'metadata.opf' in filenames and dirpath != dbdir:
+  for dirpath, dirnames, filenames0 in os.walk(dbdir):
+    if 'metadata.opf' in filenames0 and dirpath != dbdir:
       if dirpath in opfs:
         raise AssertionError('Book directory already defined: %r' % dirpath)
       opf_data = open(os.path.join(dirpath, 'metadata.opf')).read()
-      filenames = sorted(
-          (filename, os.stat(os.path.join(dirpath, filename)).st_size)
-          for filename in filenames if
-          filename != 'cover.jpg' and
-          any(1 for dotext in dotexts if filename.endswith(dotext)) and
-          is_correct_book_filename(filename, dirpath))
+      filenames = []
+      for filename in filenames0:
+        if (filename != 'cover.jpg' and
+            any(1 for dotext in dotexts if filename.endswith(dotext))):
+          if is_correct_book_filename(filename, dirpath):
+            filenames.append(
+                (filename, os.stat(os.path.join(dirpath, filename)).st_size))
+          else:
+            incorrect_file_count += 1
+      filenames.sort()
       opfs[dirpath] = (opf_data, filenames)
       del opf_data, filenames
-  # TODO(pts): Print non-correct count as well.
   file_count = sum(len(x[1]) for x in opfs.itervalues())
-  print >>sys.stderr, 'info: Found %s e-book file%s.' % (
-      file_count, 's' * (file_count != 1))
+  print >>sys.stderr, 'info: Found %d e-book file%s and discarded %d.' % (
+      file_count, 's' * (file_count != 1), incorrect_file_count)
 
   # Parse .opf files.
   # TODO(pts): If this is slow, redesign this tool.
