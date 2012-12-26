@@ -23,6 +23,7 @@ import sqlite3
 import sys
 
 import calibre
+from calibre.customize import builtins
 from calibre.library import database2
 from calibre.ebooks.metadata import opf2
 
@@ -259,6 +260,24 @@ BOOK_ROW_CLASSES = (
     BooksAuthorsLinkRow, BooksLanguagesLinkRow, BooksPublishersLinkRow,
     BooksRatingsLinkRow, BooksSeriesLinkRow, BooksSeriesLinkRow)
 """The order is irrelevant."""
+
+
+def get_extensions(builtins_module):
+  mrp = builtins.MetadataReaderPlugin
+  extensions = set()
+  for name in dir(builtins_module):
+    class_obj = getattr(builtins_module, name)
+    if type(class_obj) == type(mrp) and issubclass(class_obj, mrp):
+      for extension in class_obj.file_types:
+        extensions.add(extension.lower())
+  # Example: 'rtf', 'prc', 'azw1', 'odt', 'cbr', 'pml', 'rar', 'cbz', 'snb',
+  # 'htmlz', 'txt', 'updb', 'zip', 'oebzip', 'chm', 'lit', 'imp', 'html',
+  # 'rb', 'fb2', 'docx', 'azw3', 'azw4', 'txtz', 'lrf', 'tpz', 'opf', 'lrx',
+  # 'epub', 'mobi', 'pmlz', 'pobi', 'pdf', 'pdb', 'azw'.
+  return extensions
+
+
+EXTENSIONS = frozenset(get_extensions(builtins))
 
 
 def main(argv):
