@@ -9,6 +9,7 @@ Calibre while this script is running.
 !! TODO(pts): Verify this claim, use EXCLUSIVE locking.
 
 TODO(pts): Renumber books with a conflicting ID.
+TODO(pts): Add UNIQUE(name) indexes later.
 """
 
 # by pts@fazekas.hu at Wed Dec 26 12:54:02 CET 2012
@@ -95,6 +96,171 @@ BOOK_TABLES = (
 """The order is irrelevant."""
 
 
+class DataRow(object):
+  table_name = 'data'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NON NULL,
+      'format',  # TEXT NON NULL COLLATE NOCASE,
+      'uncompressed_size',  # INTEGER NON NULL,
+      'name',  # TEXT NON NULL,
+  )
+  
+
+class BooksRow(object):
+  table_name = 'books'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY AUTOINCREMENT,
+      'title',  # TEXT NOT NULL DEFAULT 'Unknown' COLLATE NOCASE,
+      'sort',  # TEXT COLLATE NOCASE,
+      'timestamp',  # TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      'pubdate',  # TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      'series_index',  # REAL NOT NULL DEFAULT 1.0,
+      'author_sort',  # TEXT COLLATE NOCASE,
+      'isbn',  # TEXT DEFAULT "" COLLATE NOCASE,
+      'lccn',  # TEXT DEFAULT "" COLLATE NOCASE,
+      'path',  # TEXT NOT NULL DEFAULT "",
+      'flags',  # INTEGER NOT NULL DEFAULT 1
+      'uuid',  # TEXT,
+      'has_cover',  # BOOL DEFAULT 0,
+      'last_modified',  # TIMESTAMP NOT NULL DEFAULT "2000-01-01 00:00:00+00:00"
+  )
+
+
+class AuthorsRow(object):
+  table_name = 'authors'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'name',  # TEXT NOT NULL COLLATE NOCASE,
+      'sort',  # TEXT COLLATE NOCASE,
+      'link',  # TEXT NOT NULL DEFAULT "",
+  )
+
+
+class IdentifiersRow(object):
+  table_name = 'identifiers'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NON NULL,
+      'type',  # TEXT NON NULL DEFAULT "isbn" COLLATE NOCASE,
+      'val',  # TEXT NON NULL COLLATE NOCASE,
+  )
+
+
+class LanguagesRow(object):
+  table_name = 'languages'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'lang_code',  # TEXT NON NULL COLLATE NOCASE,
+  )
+
+
+class CommentsRow(object):
+  table_name = 'comments'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NON NULL,
+      'text',  # TEXT NON NULL COLLATE NOCASE,
+  )
+
+
+class PublishersRow(object):
+  table_name = 'publishers'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'name',  # TEXT NOT NULL COLLATE NOCASE,
+      'sort',  # TEXT COLLATE NOCASE,
+  )
+
+
+class RatingsRow(object):
+  table_name = 'ratings'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'rating',  # INTEGER CHECK(rating > -1 AND rating < 11),
+  )
+
+
+class SeriesRow(object):
+  table_name = 'series'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'name',  # TEXT NOT NULL COLLATE NOCASE,
+      'sort',  # TEXT COLLATE NOCASE,
+  )
+
+
+class TagsRow(object):
+  table_name = 'tags'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'name',  # TEXT NOT NULL COLLATE NOCASE,
+  )
+
+
+class BooksAuthorsLinkRow(object):
+  table_name = 'books_authors_link'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NOT NULL,
+      'author',  # INTEGER NOT NULL,
+  )
+
+
+class BooksLanguagesLinkRow(object):
+  table_name = 'books_languages_link'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NOT NULL,
+      'lang_code',  # INTEGER NOT NULL,
+      'item_order',  # INTEGER NOT NULL DEFAULT 0,
+  )
+
+
+class BooksPublishersLinkRow(object):
+  table_name = 'books_publishers_link'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NOT NULL,
+      'publisher',  # INTEGER NOT NULL,
+  )
+
+
+class BooksRatingsLinkRow(object):
+  table_name = 'books_ratings_link'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NOT NULL,
+      'rating',  # INTEGER NOT NULL,
+  )
+
+
+class BooksSeriesLinkRow(object):
+  table_name = 'books_series_link'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NOT NULL,
+      'series',  # INTEGER NOT NULL,
+  )
+
+
+class BooksSeriesLinkRow(object):
+  table_name = 'books_tags_link'
+  __slots__ = (
+      'id',  # INTEGER PRIMARY KEY,
+      'book',  # INTEGER NOT NULL,
+      'tag',  # INTEGER NOT NULL,
+  )
+
+
+BOOK_ROW_CLASSES = (
+    DataRow, BooksRow, AuthorsRow, IdentifiersRow, LanguagesRow,
+    CommentsRow, PublishersRow, RatingsRow, SeriesRow, TagsRow,
+    BooksAuthorsLinkRow, BooksLanguagesLinkRow, BooksPublishersLinkRow,
+    BooksRatingsLinkRow, BooksSeriesLinkRow, BooksSeriesLinkRow)
+"""The order is irrelevant."""
+
+
 def main(argv):
   if (len(argv) > 1 and argv[1] in ('--help', '-h')):
     print usage(argv[0])
@@ -161,6 +327,13 @@ def main(argv):
   c.execute('BEGIN EXCLUSIVE')  # Locks the file immediately.
   for sql in master_by_type['table']:
     c.execute(sql)  # 'CREATE TABLE ...'.
+  for row_class in BOOK_ROW_CLASSES:
+    c.execute('SELECT * FROM %s LIMIT 0' %
+              escape_sqlite_name(row_class.table_name))
+    fields = tuple(x[0] for x in c.description)
+    if fields != row_class.__slots__:
+      raise RuntimeError('Unexpected fields in table %s: expected=%r got=%r' %
+                         (row_class.table_name, row_class.__slots__, fields))
 
   # Copy the non-book tables.
   for table in tables_to_copy:
@@ -207,6 +380,11 @@ def main(argv):
       if mi.has_cover and not mi.cover:
         mi.cover = 'cover.jpg'
       inmemory_opfs[opf_dir] = opf2.metadata_to_opf(mi)
+
+      mi2 = opf2.OPF(cStringIO.StringIO(inmemory_opfs[opf_dir])).to_book_metadata()
+      print mi2
+      print sorted(dir(mi2))
+      print mi2._data
     del db
   else:
     print >>sys.stderr, 'Found metadata.opf for all books in metadata.db.'
