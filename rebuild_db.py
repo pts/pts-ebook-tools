@@ -39,6 +39,15 @@ def encode_unicode(data):
       raise AssertionError('Uknown character in %r. Please set up system '
                            'locale properly, or use ASCII only.' % data)
     return data.encode(calibre.preferred_encoding)
+  else:
+    raise TypeError(type(data))
+
+
+def encode_utf8(data):
+  if isinstance(data, str):
+    return data
+  elif isinstance(data, unicode):
+    return data.encode('UTF-8')
   elif data is None:
     return data
   else:
@@ -261,7 +270,10 @@ BOOK_ROW_CLASSES = (
     CommentsRow, PublishersRow, RatingsRow, SeriesRow, TagsRow,
     BooksAuthorsLinkRow, BooksLanguagesLinkRow, BooksPublishersLinkRow,
     BooksRatingsLinkRow, BooksSeriesLinkRow, BooksSeriesLinkRow)
-"""The order is irrelevant."""
+"""The order is irrelevant.
+
+This sequence is used for consistency checks, don't remove elements from it.
+"""
 
 
 def get_extensions(builtins_module):
@@ -466,8 +478,12 @@ def main(argv):
   print >>sys.stderr, 'info: Adding books to the new database.'
   ids = {
       BooksRow: 0,
+      AuthorsRow: 0,
+      BooksAuthorsLinkRow: 0,
   }
+  authors_by_name = {}
   books_sql = create_insert_sql(BooksRow)
+  authors_sql = create_insert_sql(AuthorsRow)
   for opf_dir in sorted(opfs):
     # `mi' contains strings as unicode.
     mi, filenames = opfs[opf_dir]
@@ -477,8 +493,8 @@ def main(argv):
     new_id(ids, books_row)
     if mi.title_sort is None:
       raise AssertionError
-    books_row.title = encode_unicode(mi.title) or '?'
-    books_row.sort = encode_unicode(mi.title_sort)
+    books_row.title = encode_utf8(mi.title) or '?'
+    books_row.sort = encode_utf8(mi.title_sort)
     books_row.timestamp = mi.timestamp
     books_row.pubdate = mi.pubdate
     if mi.series_index is None:
@@ -488,12 +504,33 @@ def main(argv):
       books_row.series_index = float(mi.series_index)
     if mi.author_sort is None:
       raise AssertionError
-    books_row.author_sort = encode_unicode(mi.author_sort)
-    books_row.isbn = encode_unicode(mi.isbn)
+    # TODO(pts): Test with a book with multiple authors.
+    for author in mi.authors:
+      author = encode_utf8(author)
+      author_id = authors_by_name.get(author)
+      if author_id is None:
+        authors_row = AuthorsRow()
+        new_id(ids, authors_row)
+        authors_by_name[author] = author_id = authors_row.id
+        authors_row.name = author
+        authors_row.sort = encode_utf8(  # TODO(pts): Is this correct?
+            mi.author_sort_map.get(author, mi.author_sort))
+        authors_row.link = encode_utf8(  # TODO(pts): Is this correct?
+            mi.author_link_map.get(author, ''))  # Seems to be always ''.
+        c.execute(authors_sql, [
+            getattr(authors_row, name) for name in authors_row.__slots__])
+      xid = ids[BooksAuthorsLinkRow] + 1
+      ids[BooksAuthorsLinkRow] = xid
+      c.execute('INSERT INTO books_authors_link VALUES (?,?,?)',
+                (xid, books_row.id, author_id))
+    # TODO(pts): Use mi.author_sort_map, mi.author_link_map (if there are
+    # multiple authors).
+    books_row.author_sort = encode_utf8(mi.author_sort)
+    books_row.isbn = encode_utf8(mi.isbn)
     books_row.lccn = None  # Calibre doesn't seem to use this field.
     books_row.path = opf_dir.replace('/', os.sep)
     books_row.flags = 1  # Calibre doesn't seem to use this field.
-    books_row.uuid = encode_unicode(mi.uuid)
+    books_row.uuid = encode_utf8(mi.uuid)
     books_row.has_cover = False
     for guide in mi.guide or ():
       if getattr(guide, 'type', None) == 'cover':
