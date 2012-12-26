@@ -495,7 +495,8 @@ def main(argv):
       file_count, 's' * (file_count != 1), incorrect_file_count)
 
   # Parse .opf files.
-  # TODO(pts): If this is slow, redesign this tool.
+  # TODO(pts): This is the slowest part. Reimplement the metadata parsing, or
+  # use the even slower (2x) but simpler solution: db.set_metadata.
   # TODO(pts): What if just making a few books dirty, and let calibre reread.
   print >>sys.stderr, 'info: Parsing %d metadata.opf file%s.' % (
       len(opfs), 's' * (len(opfs) != 1))
