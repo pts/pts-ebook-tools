@@ -22,14 +22,14 @@ from calibre.ebooks.metadata import opf2
 # Please note that `assert' statements are ignored in this script.
 
 
-def decode_unicode(data):
+def encode_unicode(data):
   if isinstance(data, str):
     return data
   elif isinstance(data, unicode):
     if u'\xfffd' in data:
       raise AssertionError('Uknown character in %r. Please set up system '
                            'locale properly, or use ASCII only.' % data)
-    return data.decode(calibre.preferred_encoding)
+    return data.encode(calibre.preferred_encoding)
   else:
     raise TypeError
 
@@ -87,4 +87,4 @@ def main(argv):
 
 if __name__ == '__main__':
   # SUXX: Original, byte argv not available.
-  main(map(decode_unicode, sys.argv))
+  main(map(encode_unicode, sys.argv))
