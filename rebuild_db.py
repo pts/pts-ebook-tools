@@ -329,7 +329,6 @@ def main(argv):
     raise RuntimeError('Unsupported database encoding: %s' % encoding)
   master_by_type = {'table': [], 'index': [], 'view': [], 'trigger': []}
   tables_to_copy = []
-  autoincrement_tables = set()
   # SELECT type, name, tbl_name, sql FROM sqlite_master;
   for row in dc.execute(
       'SELECT type, sql, name FROM sqlite_master ORDER BY tbl_name, name'):
@@ -342,8 +341,6 @@ def main(argv):
         (not row[2].startswith('sqlite_') or row[2] == 'sqlite_sequence')):
       # Don't copy sqlite_stat1 etc.
       tables_to_copy.append(row[2])
-    if row[0] == 'table' and 'AUTOINCREMENT' in row[1].upper():
-      autoincrement_tables.add(row[2])
   # tables_to_copy for Calibre 0.9.11 is ['custom_columns', 'feeds',
   # 'library_id', 'preferences'].
 
@@ -510,12 +507,6 @@ def main(argv):
       books_row.last_modified = '2000-01-01 00:00:00+00:00'
     c.execute(books_sql, [
         getattr(books_row, name) for name in books_row.__slots__])
-
-  # No need to insert, sqlite has done it.
-  #for row_class in sorted(ids, key=lambda row_class: row_class.table_name):
-  #  if row_class.table_name in autoincrement_tables:
-  #    c.execute('INSERT INTO sqlite_sequence VALUES(?,?)',
-  #              (row_class.table_name, ids[row_class]))
 
   # Add functions and aggregates needed by the indexes, views and triggers
   # below.
