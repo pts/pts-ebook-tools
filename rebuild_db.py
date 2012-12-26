@@ -29,14 +29,14 @@ from calibre.ebooks.metadata import opf2
 # It's too late to change it back.
 
 
-def decode_unicode(data):
+def encode_unicode(data):
   if isinstance(data, str):
     return data
   elif isinstance(data, unicode):
     if u'\xfffd' in data:
       raise AssertionError('Uknown character in %r. Please set up system '
                            'locale properly, or use ASCII only.' % data)
-    return data.decode(calibre.preferred_encoding)
+    return data.encode(calibre.preferred_encoding)
   else:
     raise TypeError
 
@@ -105,13 +105,12 @@ def main(argv):
   dbdir = argv[1].rstrip(os.sep) if len(argv) > 1 else '.'
   if os.path.isfile(dbdir):
     dbname = dbdir
+    dbdir = os.path.dirname(dbdir)
   else:
     dbname = os.path.join(dbdir, 'metadata.db')
-  del dbdir
-  dbpath = os.path.abspath(dbname)
-  print >>sys.stderr, 'info: Rebuilding Calibre database: ' + dbpath
+  print >>sys.stderr, 'info: Rebuilding Calibre database: ' + dbname
   if not os.path.isfile(dbname):
-    raise AssertionError('Calibre database missing: %s' % dbpath)
+    raise AssertionError('Calibre database missing: %s' % dbname)
   dbconn = sqlite3.connect(dbname, check_same_thread=False,
                          isolation_level='EXCLUSIVE')
   dbconn.text_factory = str
@@ -167,7 +166,6 @@ def main(argv):
   for table in tables_to_copy:
     table_esc = escape_sqlite_name(table)
     dc.execute('SELECT * FROM %s' % table_esc)
-    print table_esc
     if table == 'sqlite_sequence':
       if (len(dc.description) < 2 or
           dc.description[0][0] != 'name' or
@@ -188,6 +186,30 @@ def main(argv):
       # manually, and running it with c.executescript(...). Measure if it is
       # actually faster.
       c.execute(sql, row)
+
+  # Generate metadata.opf (in memory) if missing.
+  inmemory_opfs = {}
+  for row in dc.execute('SELECT path, id FROM books'):
+    opf_dir = os.path.join(dbdir, row[0].replace('/', os.sep))
+    if opf_dir in inmemory_opfs:
+      raise AssertionError
+    if not os.path.exists(os.path.join(opf_dir, 'metadata.opf')):
+      inmemory_opfs[opf_dir] = row[1]
+  if inmemory_opfs:
+    print >>sys.stderr, (
+        'info: Computing in-memory metadata.opf for %s book%s.' %
+        (len(inmemory_opfs), 's' * (len(inmemory_opfs) != 1)))
+    db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
+    for i, opf_dir in sorted((b, a) for a, b in inmemory_opfs.iteritems()):
+      # TODO(pts): Why does this work if this process already holds an
+      # EXCLUSIVE lock on metadata.db?
+      mi = db.get_metadata(i, index_is_id=True)
+      if mi.has_cover and not mi.cover:
+        mi.cover = 'cover.jpg'
+      inmemory_opfs[opf_dir] = opf2.metadata_to_opf(mi)
+    del db
+  else:
+    print >>sys.stderr, 'Found metadata.opf for all books in metadata.db.'
 
   # Add functions and aggregates needed by the indexes, views and triggers
   # below.
@@ -220,4 +242,4 @@ def main(argv):
 
 if __name__ == '__main__':
   # SUXX: Original, byte argv not available.
-  main(map(decode_unicode, sys.argv))
+  main(map(encode_unicode, sys.argv))
