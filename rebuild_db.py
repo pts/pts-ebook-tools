@@ -310,6 +310,21 @@ def create_insert_sql(row_class):
       ','.join(['?'] * len(row_class.__slots__)))
 
 
+def is_correct_book_filename(filename, opf_dir):
+  title = os.path.basename(opf_dir)
+  author = os.path.basename(os.path.dirname(opf_dir))
+  i = filename.rfind('.')
+  if i < 0:
+    raise AssertionError(repr(filename))
+  j = title.rfind(' (')  # 'name (id)'.
+  if j < 0:
+    raise AssertionError(repr(title))
+  filename = filename[:i]
+  title = title[:j]
+  expected_filename = '%s - %s' % (title, author)
+  return filename == expected_filename
+  
+
 def main(argv):
   if (len(argv) > 1 and argv[1] in ('--help', '-h')):
     print usage(argv[0])
@@ -433,16 +448,18 @@ def main(argv):
       if mi.has_cover and not mi.cover:
         mi.cover = 'cover.jpg'
       opf_data = opf2.metadata_to_opf(mi)
-      # TODO(pts): Ignore books with wrong name:
+      # TODO(pts): Properly not ignore books with wrong name:
       #   ebook-hu-mate/Thomas\ Mann/Kiralyi\ fenseg\ \(42\)/
       #   Francois Villon balladai - Francois Villon.mobi
       #   Kiralyi fenseg - Thomas Mann.epub
       #   Kiralyi fenseg - Thomas Mann.mobi
       filenames = sorted(
-          filename for filename in os.listdir(opf_dir) if
+          (filename, os.stat(os.path.join(opf_dir, filename)).st_size)
+          for filename in os.listdir(opf_dir) if
           os.path.isfile(os.path.join(opf_dir, filename)) and
           filename != 'cover.jpg' and
-          any(1 for dotext in dotexts if filename.endswith(dotext)))
+          any(1 for dotext in dotexts if filename.endswith(dotext)) and
+          is_correct_book_filename(filename, opf_dir))
       opfs[opf_dir] = (opf_data, filenames)
       del opf_data, filenames
     del db
@@ -457,11 +474,17 @@ def main(argv):
         raise AssertionError('Book directory already defined: %r' % dirpath)
       opf_data = open(os.path.join(dirpath, 'metadata.opf')).read()
       filenames = sorted(
-          filename for filename in filenames if
+          (filename, os.stat(os.path.join(dirpath, filename)).st_size)
+          for filename in filenames if
           filename != 'cover.jpg' and
-          any(1 for dotext in dotexts if filename.endswith(dotext)))
+          any(1 for dotext in dotexts if filename.endswith(dotext)) and
+          is_correct_book_filename(filename, dirpath))
       opfs[dirpath] = (opf_data, filenames)
       del opf_data, filenames
+  # TODO(pts): Print non-correct count as well.
+  file_count = sum(len(x[1]) for x in opfs.itervalues())
+  print >>sys.stderr, 'info: Found %s e-book file%s.' % (
+      file_count, 's' * (file_count != 1))
 
   # Parse .opf files.
   # TODO(pts): If this is slow, redesign this tool.
@@ -480,10 +503,12 @@ def main(argv):
       BooksRow: 0,
       AuthorsRow: 0,
       BooksAuthorsLinkRow: 0,
+      DataRow: 0,
   }
   authors_by_name = {}
   books_sql = create_insert_sql(BooksRow)
   authors_sql = create_insert_sql(AuthorsRow)
+  data_rows = []
   for opf_dir in sorted(opfs):
     # `mi' contains strings as unicode.
     mi, filenames = opfs[opf_dir]
@@ -544,6 +569,34 @@ def main(argv):
       books_row.last_modified = '2000-01-01 00:00:00+00:00'
     c.execute(books_sql, [
         getattr(books_row, name) for name in books_row.__slots__])
+    for filename, filesize in filenames:
+      i = filename.rfind('.')
+      data_row = DataRow()
+      new_id(ids, data_row)
+      data_row.book = books_row.id
+      data_row.format = filename[i + 1:].upper()  # TODO(pts): Apply a map, e.g. AZW1 to TOPAZ etc.?
+      data_row.name = filename[:i]
+      # These are not the same numbers, but they are a good approximation.
+      data_row.uncompressed_size = filesize
+      data_rows.append(data_row)
+  data_sql = create_insert_sql(DataRow)
+  for data_row in data_rows:
+    c.execute(data_sql, [
+        getattr(data_row, name) for name in data_row.__slots__])
+  del data_rows
+
+  # TODO(pts): Populate table identifiers.
+  # TODO(pts): Populate table languages.
+  # TODO(pts): Populate table comments.
+  # TODO(pts): Populate table publishers.
+  # TODO(pts): Populate table ratings.
+  # TODO(pts): Populate table series.
+  # TODO(pts): Populate table tags.
+  # TODO(pts): Populate table books_languages_link.
+  # TODO(pts): Populate table books_publishers_link.
+  # TODO(pts): Populate table books_ratings_link.
+  # TODO(pts): Populate table books_series_link.
+  # TODO(pts): Populate table books_tags_link.
 
   # Add functions and aggregates needed by the indexes, views and triggers
   # below.
