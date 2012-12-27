@@ -23,9 +23,10 @@ import sys
 
 import calibre
 from calibre.customize import builtins
+from calibre.ebooks.metadata import opf2
 from calibre.library import database2
 from calibre.library import sqlite
-from calibre.ebooks.metadata import opf2
+from calibre.utils import recycle_bin
 
 # Please note that `assert' statements are ignored in this script.
 # It's too late to change it back.
@@ -143,6 +144,11 @@ def noproxy_connect(dbpath, row_factory=None):
   db_thread.conn.isolation_level = 'EXCLUSIVE'
   db_thread.conn.execute('PRAGMA temp_store=MEMORY')
   db_thread.conn.execute('PRAGMA cache_size=-16384')  # 16 MB.
+  encoding = tuple(db_thread.conn.execute('PRAGMA encoding'))[0][0].upper()
+  if encoding not in ('UTF8', 'UTF-8'):
+    # TODO(pts): Maybe UTF16-le etc. also work.
+    raise RuntimeError('Unsupported database encoding: %s' % encoding)
+  db_thread.conn.execute('BEGIN EXCLUSIVE')
   return db_thread.conn
 
 
@@ -158,6 +164,111 @@ def _connection__commit(self):
 
 def _connection__real_commit(self):
   return super(type(self), self).commit()
+
+
+def get_db_opf(db, book_id):
+  mi = db.get_metadata(book_id, index_is_id=True)
+  if mi.has_cover and not mi.cover:
+    mi.cover = 'cover.jpg'
+  return opf2.metadata_to_opf(mi).replace('\r\n', '\n').rstrip('\r\n')
+
+
+def delete_book_from_db(db, book_id):
+  # The trigger books_delete_trg will remove from tables authors,
+  # books_authors_link etc.
+  db.conn.execute('DELETE FROM books WHERE id=?', (book_id,))
+  db.data._data[book_id] = None
+  try:
+    db.data._map.remove(book_id)
+  except ValueError:
+    pass
+  try:
+    db.data._map_filtered.remove(book_id)
+  except ValueError:
+    pass
+
+
+def delete_book(db, book_id, book_path, dbdir):
+  delete_book_from_db(db, book_id)
+  book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+  if os.path.exists(book_dir):
+    recycle_bin.delete_tree(book_dir, permanent=True)
+    try:
+      os.rmdir(os.path.dirname(book_dir))  # Remove empty author dir.
+    except OSError:
+      pass
+
+
+def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
+  """Adds a book to the database.
+
+  Creates the directory if it doesn't exist, but doesn't create or modify
+  any files.
+
+  Args:
+    force_book_id: A book ID to create the book as, or None to pick one
+      automatically.
+  Returns:
+    new_book_id.
+  """
+  # Parsing .opf files is the slowest per-book step.
+  mi = opf2.OPF(cStringIO.StringIO(opf_data)).to_book_metadata()
+  cover_href = None
+  for guide in mi._data['guide']:
+    if guide.type == 'cover':
+      cover_href = guide.href()
+      break
+  if cover_href and '/' in cover_href:
+    raise AssertionError(repr(cover_href))
+  # TODO(pts): rename cover_href to cover.jpg
+  #print dir(mi._data['guide'])
+  mi._data['guide']._resources[:] = [
+     x for x in mi._data['guide']._resources if x.type != 'cover']
+  mi.cover_data = (None, None)
+  mi.has_cover = False
+  mi.cover = None
+  if force_book_id is not None:
+    if force_book_id in db.data._map:
+      raise ValueError('Book ID %d already exists.' % force_book_id)
+    # TODO(pts): What if empty?
+    last_book_id = db.conn.execute(
+        'SELECT seq FROM sqlite_sequence WHERE name=?', ('books',)
+        ).fetchone()[0]
+    db.conn.execute('UPDATE sqlite_sequence SET seq=? WHERE name=?',
+                    (force_book_id - 1, 'books'))
+  # This also creates the directory (not the files).
+  new_book_id = db.import_book(mi, [], preserve_uuid=True)
+  if cover_href is not None:
+    db.conn.execute('UPDATE books SET has_cover=? WHERE id=?',
+                    (1, new_book_id))
+    db.data._data[new_book_id][db.FIELD_MAP['cover']] = True
+  if force_book_id is not None:
+    if force_book_id != new_book_id:
+      raise AssertionError((force_book_id, new_book_id))
+    db.conn.execute('UPDATE sqlite_sequence SET seq=? WHERE name=?',
+                    (max(last_book_id, new_book_id), 'books'))
+  if force_path is not None:
+    fm = db.FIELD_MAP
+    fm_path = fm['path']
+    book_path = encode_utf8(db.data._data[new_book_id][fm_path])
+    if book_path != force_path:
+      if dbdir is None:
+        raise ValueError
+      book_dir = os.path.join(dbdir, force_path.replace('/', os.sep))
+      if not os.path.isdir(book_dir):
+        os.makedirs(book_dir)
+      # TODO(pts): Should we use preferred_encoding instead of UTF-8?
+      db.data._data[new_book_id][fm_path] = force_path.encode('UTF-8')
+      db.conn.execute('UPDATE books SET path=? WHERE id=?',
+                      (force_path, new_book_id))
+      book_path = book_path.replace('/', os.sep)
+      while book_path:
+        try:
+          os.rmdir(os.path.join(dbdir, book_path))
+        except OSError:
+          break
+        book_path = os.path.dirname(book_path)
+  return new_book_id
 
 
 def main(argv):
@@ -181,16 +292,94 @@ def main(argv):
   sqlite.Connection.commit = _connection__commit
   sqlite.Connection.real_commit = _connection__real_commit
   database2.connect = sqlite.connect = noproxy_connect
+  # This is O(n), it reads the whole book database to db.data.
   db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
-  #print db  # <calibre.library.database2.LibraryDatabase2 object at 0x1e4db90>
-  #print db.conn  # <calibre.library.sqlite.ConnectionProxy object at 0x1e4de90>
-  #print db.conn.proxy  # <DBThread(Thread-1, started daemon 140138955478784)>
-  #print db.conn.proxy.conn  # <calibre.library.sqlite.Connection object at 0x1ea7b50>
-  #print db.data._data
 
+  # This is O(n), but fast, because generating .opf files is fast (as opposed
+  # to parsing them).
+  # TODO(pts): Ignore calibre version number changes etc.
+  print >>sys.stderr, 'info: Finding changed books: ' + dbname
+  fm = db.FIELD_MAP
+  fm_path = fm['path']
+  ids_to_delete_from_db = set()
+  books_to_update = {}
+  for book_id in db.data._map:
+    book_data = db.data._data[book_id]
+    # Should it be encode_unicode instead? Doesn't seem to matter, because
+    # Calibre generates ASCII paths.
+    book_path = encode_utf8(book_data[fm_path])
+    book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    #print (book_id, book_path, book_data[db.FIELD_MAP['title']])
+    if os.path.isdir(book_dir):
+      opf_name = os.path.join(book_dir, 'metadata.opf')
+      if os.path.exists(opf_name):
+        opf_data = open(opf_name).read().replace('\r\n', '\n').rstrip('\r\n')
+        odb_data = get_db_opf(db, book_id)
+        if opf_data != odb_data:
+          # TODO(pts): Ignore calibre version number changes etc.
+          books_to_update[book_path] = book_id
+    else:
+      ids_to_delete_from_db.add(book_id)
+  print >>sys.stderr, (
+      'info: Found %d book row%s to delete and %d book row%s to update.' %
+      (len(ids_to_delete_from_db), 's' * (len(ids_to_delete_from_db) != 1),
+       len(books_to_update), 's' * (len(books_to_update) != 1)))
+
+  if ids_to_delete_from_db:
+    # Type error in Python sqlite3:
+    # db.conn.execute('DELETE FROM books WHERE id IN (?)', (xids,))
+    # The trigger books_delete_trg will remove from tables authors,
+    # books_authors_link etc.
+    # This works for very long (e.g. 1000000) elements ids_to_delete_from_db.
+    # TODO(pts): Verify that this doesn't require several sequential scans.
+    db.conn.execute('DELETE FROM books WHERE id IN (%s)' % ','.join(map(
+        str, ids_to_delete_from_db)))
+
+  #ids_to_delete = []
+  #for book_id in tuple(db.data._map):
+  #  book_data = db.data._data[book_id]
+  #  if book_data[db.FIELD_MAP['title']] == u'Az ember trag\xe9di\xe1ja':
+  #    print 'DELETING MADACH !!', book_id
+  #    book_path = encode_utf8(book_data[fm_path])
+  #    ids_to_delete.append((book_id, book_path))
+  #for book_id, book_path in ids_to_delete:
+  #  delete_book(db, book_id, book_path, dbdir)
+  delete_book_from_db(db, 412)
+
+  new_book_id = add_book(db, open('mad.opf').read(), 412,
+      'foo/bar', dbdir)
+  #    'Madach, Imre/Az ember tragediaja (412)')
+  print ('IMPORT', new_book_id)
+  # !! import to data.
+  open('madb.opf', 'w').write(get_db_opf(db, new_book_id) + '\n')
+
+  # When adding an .opf file with `calibredb add', the following fields change:
+  # <dc:identifier opf:scheme="calibre" id="calibre_id">410</dc:identifier>
+  # <dc:identifier opf:scheme="uuid" id="uuid_id">fb6d6d55-af71-42ab-9613-4aa73c4d8c1e</dc:identifier>
+  # <dc:contributor opf:file-as="calibre" opf:role="bkp">calibre (0.9.11) [http://calibre-ebook.com]</dc:contributor>
+  # ... also a new directory gets created etc.
+  # db.import_book(mi, [], preserve_uuid=True)
+  
+      
+  #for d in db.data._data:
+  #  if d is not N
+  #  print d
+  #  break
+
+  # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
+  # create the metadata.opf files for books listed in metadata_dirtied.
+  # metadata_dirtied is populated by mutation methods of db.
+  db.conn.execute('DELETE FROM metadata_dirtied')
+  # db.dump_metadata()  !! write_dirtied(db)
   db.conn.real_commit()
   db.conn.close()
+  # !! send_message()
   print >>sys.stderr, 'info: Done.'
+  # !! TODO(pts): Add books in place, i.e. without copying files.
+  # !! TODO(pts): Try to insert a book with its original id.
+  # !! TODO(pts): Update the data table.
+  # !! TODO(pts): Add missing books (calibredb add).
+  # !! TODO(pts): Notify GUI.
 
 
 if __name__ == '__main__':
