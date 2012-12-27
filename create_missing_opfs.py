@@ -58,7 +58,7 @@ def main(argv):
   fm = db.FIELD_MAP
   fm_path = fm['path']
   # TODO(pts): Do we have to replace / with os.sep on Windows?
-  book_path_items = [(i, decode_unicode(row[fm_path]))
+  book_path_items = [(i, encode_unicode(row[fm_path]))
      for i, row in enumerate(db.data._data) if row is not None]
   print >>sys.stderr, 'info: Found %d book%s in metadata.db.' % (
       len(book_path_items), 's' * (len(book_path_items) != 1))
