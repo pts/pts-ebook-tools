@@ -37,9 +37,21 @@ def encode_unicode(data):
     return data
   elif isinstance(data, unicode):
     if u'\xfffd' in data:
-      raise AssertionError('Uknown character in %r. Please set up system '
-                           'locale properly, or use ASCII only.' % data)
+      raise ValueError('Uknown character in %r. Please set up system '
+                       'locale properly, or use ASCII only.' % data)
     return data.encode(calibre.preferred_encoding)
+  else:
+    raise TypeError(type(data))
+
+
+def encode_unicode_filesystem(data):
+  if isinstance(data, str):
+    return data
+  elif isinstance(data, unicode):
+    if u'\xfffd' in data:
+      raise ValueError('Uknown character in file path %r. Please set up system '
+                       'locale properly, or rename, or use ASCII only.' % data)
+    return data.encode(calibre.filesystem_encoding)
   else:
     raise TypeError(type(data))
 
@@ -250,25 +262,84 @@ def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
   if force_path is not None:
     fm = db.FIELD_MAP
     fm_path = fm['path']
-    book_path = encode_utf8(db.data._data[new_book_id][fm_path])
+    book_path = encode_unicode_filesystem(db.data._data[new_book_id][fm_path])
     if book_path != force_path:
       if dbdir is None:
         raise ValueError
-      book_dir = os.path.join(dbdir, force_path.replace('/', os.sep))
-      if not os.path.isdir(book_dir):
-        os.makedirs(book_dir)
-      # TODO(pts): Should we use preferred_encoding instead of UTF-8?
-      db.data._data[new_book_id][fm_path] = force_path.encode('UTF-8')
-      db.conn.execute('UPDATE books SET path=? WHERE id=?',
-                      (force_path, new_book_id))
-      book_path = book_path.replace('/', os.sep)
-      while book_path:
-        try:
-          os.rmdir(os.path.join(dbdir, book_path))
-        except OSError:
-          break
-        book_path = os.path.dirname(book_path)
+      set_book_path_and_rename(db, dbdir, new_book_id, force_path)
   return new_book_id
+
+
+CALIBRE_CONTRIBUTOR_RE = re.compile(
+    r'<dc:contributor opf:file-as="calibre" opf:role="bkp">[Cc]alibre\b[^<>]*'
+    r'</dc:contributor>')
+"""Matches the <dc:contributor tag for Calibre.
+
+Example:
+
+  ('<dc:contributor opf:file-as="calibre" opf:role="bkp">'
+   'calibre (0.9.9) [http://calibre-ebook.com]</dc:contributor>')
+"""
+
+
+CALIBRE_IDENTIFIER_RE = re.compile(
+    r'<dc:identifier opf:scheme="calibre" id="calibre_id">(\d+)</dc:identifier>'
+    )
+"""Matches the <dc:identifier (book ID) tag for Calibre.
+
+Example:
+
+  'dc:identifier opf:scheme="calibre" id="calibre_id">412</dc:identifier>'
+"""
+
+
+def replace_first_match(to_data, from_data, re_obj):
+  """Returns the updated to_data."""
+  to_match = re_obj.search(to_data)
+  if to_match:
+    from_match = re_obj.search(from_data)
+    if from_match and from_match.group() != to_match.group():
+      to_data = ''.join((to_data[:to_match.start()],
+                         from_match.group(),
+                         to_data[to_match.end():]))
+  return to_data
+
+
+TRAILING_BOOK_NUMBER_RE = re.compile(r' \((\d+)\)\Z')
+"""Matches a book number in parens at the end of the string."""
+
+
+def set_book_path_and_rename(db, dbdir, book_id, new_book_path):
+  fm = db.FIELD_MAP
+  fm_path = fm['path']
+  book_data = db.data._data[book_id]
+  book_path = encode_unicode_filesystem(book_data[fm_path])
+  if book_path == new_book_path:
+    return
+  book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+  if not os.path.isdir(book_dir):
+    raise RuntimeError('Old book directory missing when renaming %r to %r.' %
+                       (book_dir, new_book_dir))
+  new_book_dir = os.path.join(dbdir, new_book_path.replace('/', os.sep))
+  # os.path.exists(...)+os.rename(...) has a race condition, but we don't care.
+  if os.path.exists(new_book_dir):
+    raise RuntimeError('New book directory already exists when renaming '
+                       '%r to %r.' %
+                       (book_dir, new_book_dir))
+  if not os.path.isdir(book_dir):
+    os.makedirs(book_dir)
+  os.rename(book_dir, new_book_dir)
+  db.data._data[book_id][fm_path] = new_book_path.decode(
+      calibre.filesystem_encoding)
+  db.conn.execute('UPDATE books SET path=? WHERE id=?',
+                  (new_book_path, book_id))
+  book_path = book_path.replace('/', os.sep)
+  while book_path:
+    try:
+      os.rmdir(os.path.join(dbdir, book_path))
+    except OSError:
+      break
+    book_path = os.path.dirname(book_path)
 
 
 def main(argv):
@@ -293,6 +364,7 @@ def main(argv):
   sqlite.Connection.real_commit = _connection__real_commit
   database2.connect = sqlite.connect = noproxy_connect
   # This is O(n), it reads the whole book database to db.data.
+  # TODO(pts): Calls dbdir.decode(filesystem_encoding), fix it.
   db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
 
   # This is O(n), but fast, because generating .opf files is fast (as opposed
@@ -303,11 +375,21 @@ def main(argv):
   fm_path = fm['path']
   ids_to_delete_from_db = set()
   books_to_update = {}
+  path_to_ids = {}
+  path_to_multiple_ids = {}
+  file_ids_to_change = {}
+  dirs_to_rename = {}
   for book_id in db.data._map:
     book_data = db.data._data[book_id]
     # Should it be encode_unicode instead? Doesn't seem to matter, because
     # Calibre generates ASCII paths.
-    book_path = encode_utf8(book_data[fm_path])
+    book_path = encode_unicode_filesystem(book_data[fm_path])
+    ids = path_to_ids.get(book_path)
+    if ids is None:
+      ids = path_to_ids[book_path] = []
+    else:
+      path_to_multiple_ids[book_path] = id
+    ids.append(book_id)
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     #print (book_id, book_path, book_data[db.FIELD_MAP['title']])
     if os.path.isdir(book_dir):
@@ -316,14 +398,51 @@ def main(argv):
         opf_data = open(opf_name).read().replace('\r\n', '\n').rstrip('\r\n')
         odb_data = get_db_opf(db, book_id)
         if opf_data != odb_data:
-          # TODO(pts): Ignore calibre version number changes etc.
-          books_to_update[book_path] = book_id
+          # TODO(pts): Also ignore some other minor changes.
+          # TODO(pts): If the UUID is different (e.g.
+          #            <dc:identifier opf:scheme="uuid" id="uuid_id">),
+          #            should we treat them as two different books?
+          odb_data = replace_first_match(
+              odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE)
+          if opf_data != odb_data:
+            opf_data2 = replace_first_match(
+                opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
+            if opf_data2 == odb_data:
+              file_ids_to_change[book_id] = (book_path, opf_data2)
+            else:
+              books_to_update[book_path] = book_id
+      match = TRAILING_BOOK_NUMBER_RE.search(book_path)
+      if match:
+        book_path2 = '%s (%d)' % (book_path[:match.start()], book_id)
+      else:
+        book_path2 = '%s (%d)' % (book_path, book_id)
+      if book_path != book_path2:
+        dirs_to_rename[book_id] = book_path2
     else:
       ids_to_delete_from_db.add(book_id)
   print >>sys.stderr, (
-      'info: Found %d book row%s to delete and %d book row%s to update.' %
+      'info: Found %d book row%s to delete, %d book row%s to update, '
+      '%d file ID%s to change and %d director%s to rename.' %
       (len(ids_to_delete_from_db), 's' * (len(ids_to_delete_from_db) != 1),
-       len(books_to_update), 's' * (len(books_to_update) != 1)))
+       len(books_to_update), 's' * (len(books_to_update) != 1),
+       len(file_ids_to_change), 's' * (len(file_ids_to_change) != 1),
+       len(dirs_to_rename), ('y', 'ies')[len(dirs_to_rename) != 1]))
+  if path_to_multiple_ids:
+    raise RuntimeError('The same book path in the database is used for '
+                       'multiple book IDs: %r' % path_to_multiple_ids)
+
+  for book_id in sorted(file_ids_to_change):
+    book_path, opf_data2 = file_ids_to_change[book_id]
+    book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+      f.write(opf_data2)
+      f.write('\n')
+
+  # We must do this after having processed file_ids_to_change.
+  for book_id in sorted(dirs_to_rename):
+    new_book_path = dirs_to_rename[book_id]
+    # TODO(pts): Do a `git mv'?
+    set_book_path_and_rename(db, dbdir, book_id, new_book_path)
 
   if ids_to_delete_from_db:
     # Type error in Python sqlite3:
@@ -335,23 +454,24 @@ def main(argv):
     db.conn.execute('DELETE FROM books WHERE id IN (%s)' % ','.join(map(
         str, ids_to_delete_from_db)))
 
+  #print books_to_update
   #ids_to_delete = []
   #for book_id in tuple(db.data._map):
   #  book_data = db.data._data[book_id]
   #  if book_data[db.FIELD_MAP['title']] == u'Az ember trag\xe9di\xe1ja':
   #    print 'DELETING MADACH !!', book_id
-  #    book_path = encode_utf8(book_data[fm_path])
+  #    book_path = encode_unicode_filesystem(book_data[fm_path])
   #    ids_to_delete.append((book_id, book_path))
   #for book_id, book_path in ids_to_delete:
   #  delete_book(db, book_id, book_path, dbdir)
-  delete_book_from_db(db, 412)
-
-  new_book_id = add_book(db, open('mad.opf').read(), 412,
-      'foo/bar', dbdir)
-  #    'Madach, Imre/Az ember tragediaja (412)')
-  print ('IMPORT', new_book_id)
-  # !! import to data.
-  open('madb.opf', 'w').write(get_db_opf(db, new_book_id) + '\n')
+  #print db.data._data[269]
+  #delete_book_from_db(db, 412)
+  #new_book_id = add_book(db, open('mad.opf').read(), 412,
+  #    'foo/bar', dbdir)
+  ##    'Madach, Imre/Az ember tragediaja (412)')
+  #print ('IMPORT', new_book_id)
+  ## !! import to data.
+  #open('madb.opf', 'w').write(get_db_opf(db, new_book_id) + '\n')
 
   # When adding an .opf file with `calibredb add', the following fields change:
   # <dc:identifier opf:scheme="calibre" id="calibre_id">410</dc:identifier>
