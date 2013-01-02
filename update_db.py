@@ -266,7 +266,8 @@ def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
     if book_path != force_path:
       if dbdir is None:
         raise ValueError
-      set_book_path_and_rename(db, dbdir, new_book_id, force_path)
+      set_book_path_and_rename(db, dbdir, new_book_id, force_path,
+                               is_new_existing=True)
   return new_book_id
 
 
@@ -309,7 +310,7 @@ TRAILING_BOOK_NUMBER_RE = re.compile(r' \((\d+)\)\Z')
 """Matches a book number in parens at the end of the string."""
 
 
-def set_book_path_and_rename(db, dbdir, book_id, new_book_path):
+def set_book_path_and_rename(db, dbdir, book_id, new_book_path, is_new_existing):
   fm = db.FIELD_MAP
   fm_path = fm['path']
   book_data = db.data._data[book_id]
@@ -322,18 +323,27 @@ def set_book_path_and_rename(db, dbdir, book_id, new_book_path):
                        (book_dir, new_book_dir))
   new_book_dir = os.path.join(dbdir, new_book_path.replace('/', os.sep))
   # os.path.exists(...)+os.rename(...) has a race condition, but we don't care.
-  if os.path.exists(new_book_dir):
-    raise RuntimeError('New book directory already exists when renaming '
-                       '%r to %r.' %
-                       (book_dir, new_book_dir))
-  if not os.path.isdir(book_dir):
-    os.makedirs(book_dir)
-  os.rename(book_dir, new_book_dir)
+  if is_new_existing:
+    if not os.path.exists(new_book_dir):
+      raise RuntimeError('New book directory missing renaming %r to %r.' %
+                         (book_dir, new_book_dir))
+  else:
+    if os.path.exists(new_book_dir):
+      raise RuntimeError('New book directory already exists when renaming '
+                         '%r to %r.' %
+                         (book_dir, new_book_dir))
+  if not os.path.isdir(new_book_dir):
+    os.makedirs(new_book_dir)
+  if is_new_existing:
+    os.rmdir(book_dir)
+  else:
+    os.rename(book_dir, new_book_dir)
   db.data._data[book_id][fm_path] = new_book_path.decode(
       calibre.filesystem_encoding)
   db.conn.execute('UPDATE books SET path=? WHERE id=?',
                   (new_book_path, book_id))
   book_path = book_path.replace('/', os.sep)
+  book_path = os.path.dirname(book_path)
   while book_path:
     try:
       os.rmdir(os.path.join(dbdir, book_path))
@@ -365,12 +375,13 @@ def main(argv):
   database2.connect = sqlite.connect = noproxy_connect
   # This is O(n), it reads the whole book database to db.data.
   # TODO(pts): Calls dbdir.decode(filesystem_encoding), fix it.
+  # TODO(pts): Why are there 4 commits in the beginning?
   db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
 
   # This is O(n), but fast, because generating .opf files is fast (as opposed
   # to parsing them).
   # TODO(pts): Ignore calibre version number changes etc.
-  print >>sys.stderr, 'info: Finding changed books: ' + dbname
+  print >>sys.stderr, 'info: Finding changed books in: ' + dbname
   fm = db.FIELD_MAP
   fm_path = fm['path']
   ids_to_delete_from_db = set()
@@ -379,6 +390,7 @@ def main(argv):
   path_to_multiple_ids = {}
   file_ids_to_change = {}
   dirs_to_rename = {}
+  # TODO(pts): Also write missing metadata.opf files.
   for book_id in db.data._map:
     book_data = db.data._data[book_id]
     # Should it be encode_unicode instead? Doesn't seem to matter, because
@@ -421,9 +433,10 @@ def main(argv):
     else:
       ids_to_delete_from_db.add(book_id)
   print >>sys.stderr, (
-      'info: Found %d book row%s to delete, %d book row%s to update, '
-      '%d file ID%s to change and %d director%s to rename.' %
-      (len(ids_to_delete_from_db), 's' * (len(ids_to_delete_from_db) != 1),
+      'info: Found %d book row%s, %d book row%s to delete, %d book row%s to '
+      'update, %d file ID%s to change and %d director%s to rename.' %
+      (len(path_to_ids), 's' * (len(path_to_ids) != 1),
+       len(ids_to_delete_from_db), 's' * (len(ids_to_delete_from_db) != 1),
        len(books_to_update), 's' * (len(books_to_update) != 1),
        len(file_ids_to_change), 's' * (len(file_ids_to_change) != 1),
        len(dirs_to_rename), ('y', 'ies')[len(dirs_to_rename) != 1]))
@@ -431,9 +444,32 @@ def main(argv):
     raise RuntimeError('The same book path in the database is used for '
                        'multiple book IDs: %r' % path_to_multiple_ids)
 
+  print >>sys.stderr, 'info: Finding new books.'
+  book_dirs = frozenset(os.path.join(dbdir, book_path.replace('/', os.sep))
+                        for book_path in path_to_ids)
+  new_book_paths = set()
+  dbprefix = dbdir + os.sep
+  for dirpath, dirnames, filenames0 in os.walk(dbdir):
+    if 'metadata.opf' in filenames0 and dirpath != dbdir:
+      if dirpath in book_dirs:
+        continue
+      if not dirpath.startswith(dbprefix):
+        raise AssertionError(dirpath, dbprefix)
+      book_path = dirpath[len(dbprefix):].replace(os.sep, '/')
+      # !! TODO(pts): Try to match it with an existing book by UUID.
+      new_book_paths.add(book_path)
+  del book_dirs
+  print 'info: Found %d new book director%s.' % (
+      len(new_book_paths), ('y', 'ies')[len(new_book_paths) != 1])
+
+  # No database or filesystem changes up to this point.
+  # TODO(pts): Verify this claim.
+  print >>sys.stderr, 'info: Applying database and filesystem changes.'
+
   for book_id in sorted(file_ids_to_change):
     book_path, opf_data2 = file_ids_to_change[book_id]
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    # TODO(pts): Open all files in binary mode?
     with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
       f.write(opf_data2)
       f.write('\n')
@@ -442,7 +478,8 @@ def main(argv):
   for book_id in sorted(dirs_to_rename):
     new_book_path = dirs_to_rename[book_id]
     # TODO(pts): Do a `git mv'?
-    set_book_path_and_rename(db, dbdir, book_id, new_book_path)
+    set_book_path_and_rename(db, dbdir, book_id, new_book_path,
+                             is_new_existing=False)
 
   if ids_to_delete_from_db:
     # Type error in Python sqlite3:
@@ -454,43 +491,70 @@ def main(argv):
     db.conn.execute('DELETE FROM books WHERE id IN (%s)' % ','.join(map(
         str, ids_to_delete_from_db)))
 
-  #print books_to_update
-  #ids_to_delete = []
-  #for book_id in tuple(db.data._map):
-  #  book_data = db.data._data[book_id]
-  #  if book_data[db.FIELD_MAP['title']] == u'Az ember trag\xe9di\xe1ja':
-  #    print 'DELETING MADACH !!', book_id
-  #    book_path = encode_unicode_filesystem(book_data[fm_path])
-  #    ids_to_delete.append((book_id, book_path))
-  #for book_id, book_path in ids_to_delete:
-  #  delete_book(db, book_id, book_path, dbdir)
-  #print db.data._data[269]
-  #delete_book_from_db(db, 412)
-  #new_book_id = add_book(db, open('mad.opf').read(), 412,
-  #    'foo/bar', dbdir)
-  ##    'Madach, Imre/Az ember tragediaja (412)')
-  #print ('IMPORT', new_book_id)
-  ## !! import to data.
-  #open('madb.opf', 'w').write(get_db_opf(db, new_book_id) + '\n')
+  if books_to_update:
+    # Without changing db.set_path to no-op, db.set_matadata would call
+    # db.set_path, which would move the rename the book and move a few
+    # files (mentioned in `data') to a different directory, and it wouldn't
+    # create metadata.opf.
+    old_set_path = db.__dict__.get('set_path')  # Doesn't work with __slots__.
+    try:
+      db.set_path = lambda *args, **kwargs: None
+      for book_path in sorted(books_to_update):
+        book_id = books_to_update[book_path]
+        book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+        opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
+        # Parsing .opf files is the slowest per-book step.
+        mi = opf2.OPF(cStringIO.StringIO(opf_data)).to_book_metadata()
+        # TODO(pts): Make this and all other database updates faster by using
+        # an in-memmory database here, and dumping it to the real database at the
+        # end (db.conn.real_commit).
+        db.set_metadata(book_id, mi, force_changes=True)
+        # !! TODO(pts): Regenerate opf_data and compare. When updating the
+        # author (<dc:creator), it seems to be different.
+    finally:
+      if old_set_path is None:
+        db.__dict__.pop('set_path', None)
+      else:
+        db.__dict__['set_path'] = old_set_path
 
-  # When adding an .opf file with `calibredb add', the following fields change:
-  # <dc:identifier opf:scheme="calibre" id="calibre_id">410</dc:identifier>
-  # <dc:identifier opf:scheme="uuid" id="uuid_id">fb6d6d55-af71-42ab-9613-4aa73c4d8c1e</dc:identifier>
-  # <dc:contributor opf:file-as="calibre" opf:role="bkp">calibre (0.9.11) [http://calibre-ebook.com]</dc:contributor>
-  # ... also a new directory gets created etc.
-  # db.import_book(mi, [], preserve_uuid=True)
-  
-      
-  #for d in db.data._data:
-  #  if d is not N
-  #  print d
-  #  break
+  # We are doing this after having processed ids_to_delte_from_db, so we have
+  # some IDs still available.
+  for book_path in sorted(new_book_paths):
+    book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
+    id_match = CALIBRE_IDENTIFIER_RE.search(opf_data)
+    if id_match is None:
+      opf_book_id = None
+    else:
+      opf_book_id = int(id_match.group(1))
+    if opf_book_id is not None and opf_book_id not in db.data._map:
+      force_book_id = opf_book_id
+    else:
+      force_book_id = None  # If ID is already used, we'll pick a new one.
+    book_id = add_book(db, opf_data, force_book_id, book_path, dbdir)
+    match = TRAILING_BOOK_NUMBER_RE.search(book_path)
+    if match:
+      force_book_path = '%s (%d)' % (book_path[:match.start()], book_id)
+    else:
+      force_book_path = '%s (%d)' % (book_path, book_id)
+    if force_book_path != book_path:
+      set_book_path_and_rename(db, dbdir, book_id, force_book_path,
+                               is_new_existing=False)
+      book_path = force_book_path
+      book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    if opf_book_id != book_id:
+      opf_data2 = '%s%d%s' % (opf_data[:id_match.start(1)], book_id,
+                              opf_data[id_match.end(1):])
+      with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+        f.write(opf_data2)
+        f.write('\n')
+
+  # TODO(pts): Import book files to data.
 
   # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
   # create the metadata.opf files for books listed in metadata_dirtied.
   # metadata_dirtied is populated by mutation methods of db.
   db.conn.execute('DELETE FROM metadata_dirtied')
-  # db.dump_metadata()  !! write_dirtied(db)
   db.conn.real_commit()
   db.conn.close()
   # !! send_message()
