@@ -15,17 +15,22 @@ TODO(pts): Renumber books with a conflicting ID.
 __author__ = 'pts@fazekas.hu (Peter Szabo)'
 
 import cStringIO
+import errno
+import multiprocessing.connection
 import os
 import os.path
 import re
+import socket
 import sqlite3
 import sys
+import traceback
 
 import calibre
 from calibre.customize import builtins
 from calibre.ebooks.metadata import opf2
 from calibre.library import database2
 from calibre.library import sqlite
+from calibre.utils import ipc
 from calibre.utils import recycle_bin
 
 # Please note that `assert' statements are ignored in this script.
@@ -352,6 +357,23 @@ def set_book_path_and_rename(db, dbdir, book_id, new_book_path, is_new_existing)
     book_path = os.path.dirname(book_path)
 
 
+def send_message(msg='', timeout=3):
+  print >>sys.stderr, 'info: Notifying the Calibre GUI of the change.'
+  try:
+    t = multiprocessing.connection.Client(ipc.gui_socket_address())
+  except socket.error, e:
+    if e[0] != errno.ENOENT:  # TODO(pts): Make this work on Windows.
+      raise
+    # We ignore the exception if Calibre is not running.
+    return
+  try:
+    t.send('refreshdb:' + msg)
+  except Exception, e:
+    print type(e)
+  finally:
+    t.close()
+
+
 def main(argv):
   if (len(argv) > 1 and argv[1] in ('--help', '-h')):
     print usage(argv[0])
@@ -565,12 +587,20 @@ def main(argv):
   db.conn.execute('DELETE FROM metadata_dirtied')
   db.conn.real_commit()
   db.conn.close()
-  # !! TODO(pts): Notify GUI.
-  # !! send_message()
+  send_message()  # Notify the Calibre GUI of the change.
   # !! TODO(pts): Do a a full database rebuild and then compare.
+  # !! TODO(pts): Write the missing metadata.opf files.
   print >>sys.stderr, 'info: Done.'
 
 
 if __name__ == '__main__':
-  # SUXX: Original, byte argv not available.
-  main(map(encode_unicode, sys.argv))
+  try:
+    # SUXX: Original, byte argv not available.
+    sys.exit(main(map(encode_unicode, sys.argv)))
+  except SystemExit:
+    pass
+  except:
+    try:
+      traceback.print_exc()
+    finally:
+      sys.exit(1)
