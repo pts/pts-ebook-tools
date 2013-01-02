@@ -481,8 +481,28 @@ def main(argv):
       # TODO(pts): Try to match it with an existing book by UUID.
       new_book_paths.add(book_path)
   del book_dirs
-  print 'info: Found %d new book director%s.' % (
+  print >>sys.stderr, 'info: Found %d new book director%s.' % (
       len(new_book_paths), ('y', 'ies')[len(new_book_paths) != 1])
+
+  print >>sys.stderr, 'info: Reading book filename rows.'
+  filename_dict = {}
+  c = db.conn.execute('SELECT * FROM data')
+  fields = tuple(x[0] for x in c.description)
+  expected_fields = ('id', 'book', 'format', 'uncompressed_size', 'name')
+  if fields != expected_fields:
+    raise RuntimeError('Unexpected fie;d names in the data table: '
+                       'got=%s expected=%s' %
+                       (','.join(fields), ','.join(expected_fields)))
+  for row in c:
+    key = (row[1], row[2])  # (book, format)
+    value = (row[4], row[0], row[3])   #  (name, id, uncompressed_size)
+    if key in filename_dict:
+      # TODO(pts): Collect all. Make it useful (e.g. print author and title).
+      raise RuntimeError('Duplicate book file: book=%d format=%s' %
+                         (row[1], row[2]))
+    filename_dict[key] = value
+  print >>sys.stderr, 'info: Found %s book filename%s.' % (
+      len(filename_dict), 's' * (len(filename_dict) != 1))
 
   # No database or filesystem changes up to this point.
   # TODO(pts): Verify this claim.
@@ -579,7 +599,13 @@ def main(argv):
         f.write('\n')
       opf_data = opf_data2
 
-  # !! TODO(pts): Import book files to the data table.
+  # Import book files to the data table.
+  # !!
+  #CREATE TABLE data ( id     INTEGER PRIMARY KEY,
+  #                          book   INTEGER NON NULL,
+  #                          format TEXT NON NULL COLLATE NOCASE,
+  #                          uncompressed_size INTEGER NON NULL,
+  #                          name TEXT NON NULL,
 
   # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
   # create the metadata.opf files for books listed in metadata_dirtied.
@@ -590,6 +616,7 @@ def main(argv):
   send_message()  # Notify the Calibre GUI of the change.
   # !! TODO(pts): Do a a full database rebuild and then compare.
   # !! TODO(pts): Write the missing metadata.opf files.
+  # !! TODO(pts): No-op if no changes.
   print >>sys.stderr, 'info: Done.'
 
 
