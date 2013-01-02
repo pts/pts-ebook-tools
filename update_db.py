@@ -456,7 +456,7 @@ def main(argv):
       if not dirpath.startswith(dbprefix):
         raise AssertionError(dirpath, dbprefix)
       book_path = dirpath[len(dbprefix):].replace(os.sep, '/')
-      # !! TODO(pts): Try to match it with an existing book by UUID.
+      # TODO(pts): Try to match it with an existing book by UUID.
       new_book_paths.add(book_path)
   del book_dirs
   print 'info: Found %d new book director%s.' % (
@@ -509,8 +509,15 @@ def main(argv):
         # an in-memmory database here, and dumping it to the real database at the
         # end (db.conn.real_commit).
         db.set_metadata(book_id, mi, force_changes=True)
-        # !! TODO(pts): Regenerate opf_data and compare. When updating the
-        # author (<dc:creator), it seems to be different.
+        opf_data = opf_data.replace('\r\n', '\n').rstrip('\r\n')
+        odb_data = replace_first_match(
+            get_db_opf(db, book_id), opf_data, CALIBRE_CONTRIBUTOR_RE)
+        # This can happen e.g. if the author (<dc:creator) is changed, then
+        # Calibre replaces name="calibre:author_link_map".
+        if opf_data != odb_data:
+          with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+            f.write(odb_data)
+            f.write('\n')
     finally:
       if old_set_path is None:
         db.__dict__.pop('set_path', None)
@@ -548,8 +555,9 @@ def main(argv):
       with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
         f.write(opf_data2)
         f.write('\n')
+      opf_data = opf_data2
 
-  # TODO(pts): Import book files to data.
+  # !! TODO(pts): Import book files to the data table.
 
   # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
   # create the metadata.opf files for books listed in metadata_dirtied.
@@ -557,13 +565,10 @@ def main(argv):
   db.conn.execute('DELETE FROM metadata_dirtied')
   db.conn.real_commit()
   db.conn.close()
-  # !! send_message()
-  print >>sys.stderr, 'info: Done.'
-  # !! TODO(pts): Add books in place, i.e. without copying files.
-  # !! TODO(pts): Try to insert a book with its original id.
-  # !! TODO(pts): Update the data table.
-  # !! TODO(pts): Add missing books (calibredb add).
   # !! TODO(pts): Notify GUI.
+  # !! send_message()
+  # !! TODO(pts): Do a a full database rebuild and then compare.
+  print >>sys.stderr, 'info: Done.'
 
 
 if __name__ == '__main__':
