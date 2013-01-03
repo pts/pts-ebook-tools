@@ -216,6 +216,11 @@ def delete_book(db, book_id, book_path, dbdir):
       pass
 
 
+BOOKS_INSERT_RE = re.compile(
+    r'(?i)\s*INSERT\s+INTO\s+books\s*\(([^-)\'"`]*)\)\s*VALUES\s*\(')
+"""Matches the beginning of INSERT INTO books."""
+
+
 def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
   """Adds a book to the database.
 
@@ -247,23 +252,30 @@ def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
   if force_book_id is not None:
     if force_book_id in db.data._map:
       raise ValueError('Book ID %d already exists.' % force_book_id)
-    # TODO(pts): What if empty?
-    last_book_id = db.conn.execute(
-        'SELECT seq FROM sqlite_sequence WHERE name=?', ('books',)
-        ).fetchone()[0]
-    db.conn.execute('UPDATE sqlite_sequence SET seq=? WHERE name=?',
-                    (force_book_id - 1, 'books'))
+    old_execute = db.conn.execute
+    try:
+      def custom_execute(query, args=()):
+        match = BOOKS_INSERT_RE.match(query)
+        if match:
+          query = 'INSERT INTO books (id, %s) VALUES (?, %s' % (
+              match.group(1), query[match.end():])
+          return old_execute(query, (force_book_id,) + tuple(args))
+        else:
+          return old_execute(query, args)
+      db.conn.execute = custom_execute
+      new_book_id = db.import_book(mi, [], preserve_uuid=True)
+    finally:
+      old_execute = None
+      del db.conn.__dict__['execute']
+  else:
+    new_book_id = db.import_book(mi, [], preserve_uuid=True)
   # This also creates the directory (not the files).
-  new_book_id = db.import_book(mi, [], preserve_uuid=True)
   if cover_href is not None:
     db.conn.execute('UPDATE books SET has_cover=? WHERE id=?',
                     (1, new_book_id))
     db.data._data[new_book_id][db.FIELD_MAP['cover']] = True
-  if force_book_id is not None:
-    if force_book_id != new_book_id:
-      raise AssertionError((force_book_id, new_book_id))
-    db.conn.execute('UPDATE sqlite_sequence SET seq=? WHERE name=?',
-                    (max(last_book_id, new_book_id), 'books'))
+  if force_book_id is not None and force_book_id != new_book_id:
+    raise AssertionError((force_book_id, new_book_id, force_path))
   if force_path is not None:
     fm = db.FIELD_MAP
     fm_path = fm['path']
