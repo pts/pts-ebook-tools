@@ -482,22 +482,88 @@ def main(argv):
   book_dirs = frozenset(os.path.join(dbdir, book_path.replace('/', os.sep))
                         for book_path in path_to_ids)
   new_book_paths = set()
-  dbprefix = dbdir + os.sep
-  for dirpath, dirnames, filenames0 in os.walk(dbdir):
-    if 'metadata.opf' in filenames0 and dirpath != dbdir:
-      if dirpath in book_dirs:
-        continue
-      if not dirpath.startswith(dbprefix):
-        raise AssertionError(dirpath, dbprefix)
-      book_path = dirpath[len(dbprefix):].replace(os.sep, '/')
-      # TODO(pts): Try to match it with an existing book by UUID.
-      new_book_paths.add(book_path)
+  dbdir_sep = dbdir + os.sep
+  fs_ext_dict = {}
+  dotexts = frozenset('.' + extension for extension in EXTENSIONS)
+  unknown_book_file_count = 0
+  dbdir_git = os.path.join(dbdir, '.git')
+  dbdir_git_sep = dbdir_git + os.sep
+  dirpaths_to_ignore = (dbdir, dbdir_git)
+  file_sizes = {}
+  for dirpath, dirnames, filenames in os.walk(dbdir):
+    if dirpath in dirpaths_to_ignore or dirpath.startswith(dbdir_git_sep):
+      continue
+    if not dirpath.startswith(dbdir_sep):
+      raise AssertionError(dirpath, dbdir_sep)
+    book_path = dirpath[len(dbdir_sep):].replace(os.sep, '/')
+    is_mo = 'metadata.opf' in filenames
+    if is_mo:
+      if dirpath not in book_dirs:
+        # TODO(pts): Try to match it with an existing book by UUID.
+        new_book_paths.add(book_path)
+
+    for filename in filenames:
+      preext, ext = os.path.splitext(filename)
+      if (ext in dotexts and filename not in ('cover.jpg', 'metadata.opf') and
+          (is_mo or book_path in path_to_ids)):
+        pathname = os.path.join(dirpath, filename)
+        file_sizes[pathname] = os.stat(pathname).st_size
+        fs_preexts = fs_ext_dict.get(dirpath)
+        if fs_preexts is None:
+          fs_preexts = fs_ext_dict[dirpath] = {}
+        exts = fs_preexts.get(preext)
+        if exts is None:
+          exts = fs_preexts[preext] = []
+        exts.append(ext)
+      elif (filename not in ('cover.jpg', 'metadata.opf') and
+            not filename.endswith('~')):
+        print >>sys.stderr, 'error: unknown book file: %s' % (
+            os.path.join(dirpath, filename))
+        unknown_book_file_count += 1
   del book_dirs
-  print >>sys.stderr, 'info: Found %d new book director%s.' % (
-      len(new_book_paths), ('y', 'ies')[len(new_book_paths) != 1])
+  for dirpath in sorted(fs_ext_dict):
+    fs_preexts = fs_ext_dict[dirpath]
+    if len(fs_preexts) <= 1:
+      continue
+    correct_preexts = [preext for preext in fs_preexts if
+        is_correct_book_filename(preext + '.mobi', dirpath)]
+    if len(correct_preexts) == 1:
+      fs_ext_dict[dirpath] = {
+          correct_preexts[0]: fs_preexts[correct_preexts[0]]}
+      del fs_preexts[correct_preexts[0]]
+    else:
+      fs_ext_dict[dirpath] = {}
+    # Now fs_preexts contains the incorrect preexts.
+    for preext in sorted(fs_preexts):
+      for ext in fs_preexts[preext]:
+        print >>sys.stderr, 'error: unknown book file: %s' % (
+            os.path.join(dirpath, preext + ext))
+        unknown_book_file_count += 1
+  fs_filename_dict = {}
+  for dirpath in sorted(fs_ext_dict):
+    fs_preexts = fs_ext_dict[dirpath]
+    book_path = dirpath[len(dbdir_sep):].replace(os.sep, '/')
+    for preext in sorted(fs_preexts):
+      for ext in fs_preexts[preext]:
+        filename = preext + ext
+        format = ext[1:].upper()
+        uncompressed_size = file_sizes[os.path.join(dirpath, filename)]
+        data_id = None
+        key = (book_path, format)
+        value = [preext, data_id, uncompressed_size]
+        if key in fs_filename_dict:
+          raise AssertionError(key)
+        fs_filename_dict[key] = value
+  del file_sizes
+  print >>sys.stderr, (
+      'info: Found %d new book director%s, %d unknown book file%s and '
+      '%d book file%s.' % (
+      len(new_book_paths), ('y', 'ies')[len(new_book_paths) != 1],
+      unknown_book_file_count, 's' * (unknown_book_file_count != 1),
+      len(fs_filename_dict), 's' * (fs_filename_dict != 1)))
 
   print >>sys.stderr, 'info: Reading book filename rows.'
-  filename_dict = {}
+  db_filename_dict = {}
   c = db.conn.execute('SELECT * FROM data')
   fields = tuple(x[0] for x in c.description)
   expected_fields = ('id', 'book', 'format', 'uncompressed_size', 'name')
@@ -506,15 +572,38 @@ def main(argv):
                        'got=%s expected=%s' %
                        (','.join(fields), ','.join(expected_fields)))
   for row in c:
-    key = (row[1], row[2])  # (book, format)
-    value = (row[4], row[0], row[3])   #  (name, id, uncompressed_size)
-    if key in filename_dict:
+    book_id = row[1]
+    # TODO(pts): Don't call encode_unicode_filesystem this often.
+    book_path = encode_unicode_filesystem(db.data._data[book_id][fm_path])
+    key = (book_path, encode_unicode_filesystem(row[2]))  # (book_path, format)
+    value = [encode_unicode_filesystem(row[4]), row[0], row[3]]   #  (name, id, uncompressed_size)
+    if key in db_filename_dict:
       # TODO(pts): Collect all. Make it useful (e.g. print author and title).
       raise RuntimeError('Duplicate book file: book=%d format=%s' %
                          (row[1], row[2]))
-    filename_dict[key] = value
-  print >>sys.stderr, 'info: Found %s book filename%s.' % (
-      len(filename_dict), 's' * (len(filename_dict) != 1))
+    db_filename_dict[key] = value
+  book_data_updates = []
+  book_data_inserts = []
+  book_data_deletes = []
+  for key in sorted(fs_filename_dict):
+    fs_value = fs_filename_dict[key]
+    db_value = db_filename_dict.get(key)
+    if db_value:
+      fs_value[1] = db_value[1]  # Copy data_id.
+      if fs_value != db_value:
+        book_data_updates.append(key + tuple(fs_value))  # (book_path, format, name, book_id, uncompressed_size).
+    else:
+      book_data_inserts.append(key + (fs_value[0], fs_value[2]))  # (book_path, format, name, uncompressed_size).
+  for key in sorted(db_filename_dict):
+    if key not in fs_filename_dict:
+      book_data_deletes.append(key)  # (book_path, format).
+  print >>sys.stderr, (
+      'info: Found %s book filename row%s; '
+      'will update %d, insert %d, delete %d.' %
+      (len(db_filename_dict), 's' * (len(db_filename_dict) != 1),
+       len(book_data_updates), len(book_data_inserts), len(book_data_deletes)))
+
+  # !! Do these: book_data_*.
 
   # No database or filesystem changes up to this point.
   # TODO(pts): Verify this claim.
@@ -629,6 +718,8 @@ def main(argv):
   # !! TODO(pts): Do a a full database rebuild and then compare.
   # !! TODO(pts): Write the missing metadata.opf files.
   # !! TODO(pts): No-op if no changes.
+  # TODO(pts): Add rebuild_db.py to another repository, indicate that it's
+  # incorrect.
   print >>sys.stderr, 'info: Done.'
 
 
