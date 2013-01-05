@@ -386,6 +386,19 @@ def send_message(msg='', timeout=3):
     t.close()
 
 
+def get_max_book_id(db, used_book_ids, max_book_id=None):
+  if max_book_id is None:
+    for row in db.conn.execute(
+        'SELECT seq FROM sqlite_sequence WHERE name=?', ('books',)):
+      max_book_id = row[0]
+      break
+    else:
+      max_book_id = 0
+    if used_book_ids:
+      max_book_id = max(max_book_id, max(used_book_ids))
+  return max_book_id
+
+
 def main(argv):
   if (len(argv) > 1 and argv[1] in ('--help', '-h')):
     print usage(argv[0])
@@ -667,8 +680,68 @@ def main(argv):
       else:
         db.__dict__['set_path'] = old_set_path
 
-  # We are doing this after having processed ids_to_delte_from_db, so we have
-  # some IDs still available.
+  # We are adding new books after having processed ids_to_delte_from_db, so
+  # we have some IDs still available.
+  #
+  # First we preallocate the book IDs to the new paths. We do it to avoid
+  # bugs causing conflicts within existing directories in new_book_paths.
+  new_book_paths_without_id = []
+  new_book_path_to_id = {}
+  used_book_ids = set(db.data._map)
+  max_book_id = None
+  # Assign free book IDs for books which request a specific one.
+  for book_path in sorted(new_book_paths):
+    book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
+    id_match = CALIBRE_IDENTIFIER_RE.search(opf_data)
+    if id_match is None:
+      book_id = None
+    else:
+      book_id = int(id_match.group(1))
+      if book_id in used_book_ids:
+        book_id = None
+      else:
+        new_book_path_to_id[book_path] = book_id
+        used_book_ids.add(book_id)
+    if book_id is None:
+      new_book_paths_without_id.append(book_path)
+  # Assign free book IDs to the remaining books.
+  if new_book_paths_without_id:
+    max_book_id = get_max_book_id(db, used_book_ids, max_book_id)
+    for book_path in new_book_paths_without_id:
+      max_book_id += 1
+      new_book_path_to_id[book_path] = max_book_id
+      used_book_ids.add(max_book_id)
+  # Make sure that conflicting book directories don't exist.
+  for book_path in sorted(new_book_paths):
+    book_id = new_book_path_to_id[book_path]
+    match = TRAILING_BOOK_NUMBER_RE.search(book_path)
+    if match:
+      force_book_path = '%s (%d)' % (book_path[:match.start()], book_id)
+    else:
+      force_book_path = '%s (%d)' % (book_path, book_id)
+    if book_path != force_book_path:
+      force_book_dir = os.path.join(dbdir, force_book_path.replace('/', os.sep))
+      if os.path.exists(force_book_dir):
+        # Pick a larger ID if force_book_path (i.e. the final book_path)
+        # already exists, i.e. occupied by something else.
+        used_book_ids.remove(book_id)
+        max_book_id = get_max_book_id(db, used_book_ids, max_book_id)
+        while True:
+          max_book_id += 1
+          if match:
+            force_book_path = '%s (%d)' % (book_path[:match.start()], book_id)
+          else:
+            force_book_path = '%s (%d)' % (book_path, book_id)
+          force_book_dir = os.path.join(
+              dbdir, force_book_path.replace('/', os.sep))
+          if not os.path.exists(force_book_dir):
+            break
+        new_book_path_to_id[book_path] = max_book_id
+        used_book_ids.add(max_book_id)
+  for book_path in sorted(new_book_paths):
+    book_id = new_book_path_to_id[book_path]
+  del max_book_id
   for book_path in sorted(new_book_paths):
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
@@ -677,16 +750,13 @@ def main(argv):
       opf_book_id = None
     else:
       opf_book_id = int(id_match.group(1))
-    if opf_book_id is not None and opf_book_id not in db.data._map:
-      force_book_id = opf_book_id
-    else:
-      force_book_id = None  # If ID is already used, we'll pick a new one.
+    force_book_id = new_book_path_to_id[book_path]
     book_id = add_book(db, opf_data, force_book_id, book_path, dbdir)
     match = TRAILING_BOOK_NUMBER_RE.search(book_path)
     if match:
-      force_book_path = '%s (%d)' % (book_path[:match.start()], book_id)
+      force_book_path = '%s (%d)' % (book_path[:match.start()], force_book_id)
     else:
-      force_book_path = '%s (%d)' % (book_path, book_id)
+      force_book_path = '%s (%d)' % (book_path, force_book_id)
     if force_book_path != book_path:
       set_book_path_and_rename(db, dbdir, book_id, force_book_path,
                                is_new_existing=False)
