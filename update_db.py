@@ -617,6 +617,12 @@ def main(argv):
        len(book_data_updates), len(book_data_inserts), len(book_data_deletes)))
 
   # No database or filesystem changes up to this point.
+  if not (ids_to_delete_from_db or books_to_update or file_ids_to_change or
+          dirs_to_rename or new_book_paths or book_data_updates or
+          book_data_inserts or book_data_deletes):
+    print >>sys.stderr, 'info: Nothing to modify.'
+    return
+
   # TODO(pts): Verify this claim.
   print >>sys.stderr, 'info: Applying database and filesystem changes.'
 
@@ -804,7 +810,7 @@ def main(argv):
   send_message()  # Notify the Calibre GUI of the change.
   # !! TODO(pts): Do a a full database rebuild and then compare correctness.
   # !! TODO(pts): Write the missing metadata.opf files.
-  # !! TODO(pts): No-op if no changes.
+  # !! TODO(pts): Why do we have 3 data row updates after the first run?
   # TODO(pts): Add rebuild_db.py to another repository, indicate that it's
   # incorrect.
   print >>sys.stderr, 'info: Done.'
