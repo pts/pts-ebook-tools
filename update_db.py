@@ -589,7 +589,7 @@ def main(argv):
     # TODO(pts): Don't call encode_unicode_filesystem this often.
     book_path = encode_unicode_filesystem(db.data._data[book_id][fm_path])
     key = (book_path, encode_unicode_filesystem(row[2]))  # (book_path, format)
-    value = [encode_unicode_filesystem(row[4]), row[0], row[3]]   #  (name, id, uncompressed_size)
+    value = [encode_unicode_filesystem(row[4]), row[0], row[3]]   #  (name, data_id, uncompressed_size)
     if key in db_filename_dict:
       # TODO(pts): Collect all. Make it useful (e.g. print author and title).
       raise RuntimeError('Duplicate book file: book=%d format=%s' %
@@ -604,19 +604,17 @@ def main(argv):
     if db_value:
       fs_value[1] = db_value[1]  # Copy data_id.
       if fs_value != db_value:
-        book_data_updates.append(key + tuple(fs_value))  # (book_path, format, name, book_id, uncompressed_size).
+        book_data_updates.append(key + tuple(fs_value))  # (book_path, format, name, data_id, uncompressed_size).
     else:
       book_data_inserts.append(key + (fs_value[0], fs_value[2]))  # (book_path, format, name, uncompressed_size).
   for key in sorted(db_filename_dict):
     if key not in fs_filename_dict:
-      book_data_deletes.append(key)  # (book_path, format).
+      book_data_deletes.append(key + (db_filename_dict[key][1],))  # (book_path, format, data_id).
   print >>sys.stderr, (
       'info: Found %s book filename row%s; '
       'will update %d, insert %d, delete %d.' %
       (len(db_filename_dict), 's' * (len(db_filename_dict) != 1),
        len(book_data_updates), len(book_data_inserts), len(book_data_deletes)))
-
-  # !! Do these: book_data_*.
 
   # No database or filesystem changes up to this point.
   # TODO(pts): Verify this claim.
@@ -631,8 +629,12 @@ def main(argv):
       f.write('\n')
 
   # We must do this after having processed file_ids_to_change.
+  old_path_to_ids = dict(path_to_ids)
   for book_id in sorted(dirs_to_rename):
     new_book_path = dirs_to_rename[book_id]
+    if new_book_path in path_to_ids:
+      raise AssertionError(new_book_path)
+    path_to_ids[new_book_path] = path_to_ids.pop(book_path)
     # TODO(pts): Do a `git mv'?
     set_book_path_and_rename(db, dbdir, book_id, new_book_path,
                              is_new_existing=False)
@@ -739,8 +741,6 @@ def main(argv):
             break
         new_book_path_to_id[book_path] = max_book_id
         used_book_ids.add(max_book_id)
-  for book_path in sorted(new_book_paths):
-    book_id = new_book_path_to_id[book_path]
   del max_book_id
   for book_path in sorted(new_book_paths):
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
@@ -752,6 +752,7 @@ def main(argv):
       opf_book_id = int(id_match.group(1))
     force_book_id = new_book_path_to_id[book_path]
     book_id = add_book(db, opf_data, force_book_id, book_path, dbdir)
+    old_path_to_ids[book_path] = ids = [book_id]
     match = TRAILING_BOOK_NUMBER_RE.search(book_path)
     if match:
       force_book_path = '%s (%d)' % (book_path[:match.start()], force_book_id)
@@ -762,6 +763,7 @@ def main(argv):
                                is_new_existing=False)
       book_path = force_book_path
       book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    path_to_ids[force_book_path] = ids
     if opf_book_id != book_id:
       opf_data2 = '%s%d%s' % (opf_data[:id_match.start(1)], book_id,
                               opf_data[id_match.end(1):])
@@ -770,13 +772,28 @@ def main(argv):
         f.write('\n')
       opf_data = opf_data2
 
-  # Import book files to the data table.
-  # !!
-  #CREATE TABLE data ( id     INTEGER PRIMARY KEY,
-  #                          book   INTEGER NON NULL,
-  #                          format TEXT NON NULL COLLATE NOCASE,
-  #                          uncompressed_size INTEGER NON NULL,
-  #                          name TEXT NON NULL,
+  # Modify the data table.
+  for book_path, format, name, data_id, uncompressed_size in book_data_updates:
+    book_id = old_path_to_ids[book_path][0]
+    #print 'UPDATE', (book_id, data_id, book_path, format, name, uncompressed_size)
+    #print list(db.conn.execute('SELECT * FROM data WHERE id=?', (data_id,)))
+    db.conn.execute('UPDATE data SET uncompressed_size=?, name=? WHERE id=?',
+                    (uncompressed_size, name, data_id))
+    # TODO(pts): Shouldn't we convert format to unicode?
+    #db.conn.execute('UPDATE data SET uncompressed_size=? AND name=? '
+    #                'WHERE book=? AND format=?',
+    #                (uncompressed_size, name, book_id, format))
+  for book_path, format, name, uncompressed_size in book_data_inserts:
+    book_id = old_path_to_ids[book_path][0]
+    #print 'INSERT', (book_id, book_path, format, name, uncompressed_size)
+    # TODO(pts): Shouldn't we convert format etc. to unicode?
+    db.conn.execute('INSERT INTO data (uncompressed_size, name, book, format) '
+                    'VALUES (?, ?, ?, ?)',
+                    (uncompressed_size, name, book_id, format))
+  if book_data_deletes:
+    # TODO(pts): Test this.
+    db.conn.execute('DELETE FROM data WHERE id IN (%s)' % ','.join(map(
+        str, (data_id for _, _, data_id in book_data_deletes))))
 
   # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
   # create the metadata.opf files for books listed in metadata_dirtied.
@@ -785,7 +802,7 @@ def main(argv):
   db.conn.real_commit()
   db.conn.close()
   send_message()  # Notify the Calibre GUI of the change.
-  # !! TODO(pts): Do a a full database rebuild and then compare.
+  # !! TODO(pts): Do a a full database rebuild and then compare correctness.
   # !! TODO(pts): Write the missing metadata.opf files.
   # !! TODO(pts): No-op if no changes.
   # TODO(pts): Add rebuild_db.py to another repository, indicate that it's
