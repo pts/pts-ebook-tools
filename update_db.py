@@ -12,7 +12,11 @@ e.g. it renames book directories so that they include the book ID, changes
 the book ID in metadata.opf if there is a conflict etc. It tries to make as
 few changes as necessary.
 
-TODO(pts): Add the `git ...' commands to run.
+This script runs `git add' on all files (metadata.db, metadata.opf,
+cover.jpg and book data files) in the Calibre library if it finds that the
+library is in a Git repository.
+
+TODO(pts): Restore metadata.db to the version before the merge conflict.
 TODO(pts): Verify the locking claims, use EXCLUSIVE locking.
 TODO(pts): Do a a full database rebuild and then compare correctness.
 TODO(pts): This script is faster than expected at a full rebuild (after
@@ -34,6 +38,7 @@ import os
 import os.path
 import re
 import socket
+import subprocess
 import sqlite3
 import sys
 import traceback
@@ -234,7 +239,8 @@ BOOKS_INSERT_RE = re.compile(
 """Matches the beginning of INSERT INTO books."""
 
 
-def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
+def add_book(db, opf_data, is_git,
+             force_book_id=None, force_path=None, dbdir=None):
   """Adds a book to the database.
 
   Creates the directory if it doesn't exist, but doesn't create or modify
@@ -297,7 +303,7 @@ def add_book(db, opf_data, force_book_id=None, force_path=None, dbdir=None):
       if dbdir is None:
         raise ValueError
       set_book_path_and_rename(db, dbdir, new_book_id, force_path,
-                               is_new_existing=True)
+                               is_new_existing=True, is_git=is_git)
   return new_book_id
 
 
@@ -340,7 +346,8 @@ TRAILING_BOOK_NUMBER_RE = re.compile(r' \((\d+)\)\Z')
 """Matches a book number in parens at the end of the string."""
 
 
-def set_book_path_and_rename(db, dbdir, book_id, new_book_path, is_new_existing):
+def set_book_path_and_rename(db, dbdir, book_id, new_book_path,
+                             is_new_existing, is_git):
   fm = db.FIELD_MAP
   fm_path = fm['path']
   book_data = db.data._data[book_id]
@@ -367,7 +374,13 @@ def set_book_path_and_rename(db, dbdir, book_id, new_book_path, is_new_existing)
   if is_new_existing:
     os.rmdir(book_dir)
   else:
-    os.rename(book_dir, new_book_dir)
+    if is_git:
+      os.rmdir(new_book_dir)
+      # `git mv' needs at least one file added.
+      git_add(os.path.join(book_dir, 'metadata.opf'))
+      git_mv(book_dir, new_book_dir)
+    else:
+      os.rename(book_dir, new_book_dir)
   db.data._data[book_id][fm_path] = new_book_path.decode(
       calibre.filesystem_encoding)
   db.conn.execute('UPDATE books SET path=? WHERE id=?',
@@ -412,8 +425,96 @@ def get_max_book_id(db, used_book_ids, max_book_id=None):
   return max_book_id
 
 
+def call_xargs(xargs, cmd, **kwargs):
+  """Call subprocess cmd with many command-line arguments (xargs)."""
+  if not isinstance(xargs, (tuple, list)):
+    raise TypeError
+  if not isinstance(cmd, (tuple, list)):
+    raise TypeError
+  xargs = list(xargs)
+  cmd = list(cmd)
+  if not getattr(errno, 'E2BIG', None):  # 'Argument list too long'.
+    return subprocess.call(cmd + xargs, **kwargs)
+  try:
+    return subprocess.call(cmd + xargs, **kwargs)
+  except OSError, e:
+    if e[0] != errno.E2BIG:
+      raise
+  i = 0
+  size = len(xargs) >> 1
+  while 1:
+    if not size:
+      raise RuntimeError('Even a single-arg command is too long.')
+    try:
+      status = subprocess.call(cmd + xargs[i : i + size], **kwargs)
+      if status:
+        return status
+      i += size
+      size = len(xargs) - i
+      if not size:  # Everything processed.
+        return status
+    except OSError, e:
+      if e[0] != errno.E2BIG:
+        raise
+      size >>= 1  # Try passing half as many arguments.
+
+
+def is_dir_in_git(dir_name):
+  """This function assumes that os.environ['GIT_DIR'] is not set."""
+  p = subprocess.Popen(('git', 'rev-parse', '--show-toplevel'),
+                       preexec_fn=lambda: os.chdir(dir_name),
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  try:
+    stdout, stderr = p.communicate()
+  finally:
+    status = p.wait()
+  return not status
+
+
+def git_add(filename):
+  status = subprocess.call(
+      ('git', 'add', '--', os.path.basename(filename)),
+      preexec_fn=lambda: os.chdir(os.path.dirname(filename)))
+  if status:
+    raise RuntimeError('git-add failed with status=0x%x' % status)
+
+
+def git_mv(oldname, newname):
+  olds = oldname.split(os.sep)
+  news = newname.split(os.sep)
+  i = 0
+  limit = min(len(olds), len(news))
+  while i < limit and olds[i] == news[i]:
+    i += 1
+  if i:
+    status = subprocess.call(
+        ('git', 'mv', '--', os.sep.join(olds[i:]), os.sep.join(news[i:])),
+        preexec_fn=lambda: os.chdir(os.sep.join(olds[:i])))
+  else:
+    status = subprocess.call(('git', 'mv', '--', oldname, newname))
+  if status:
+    raise RuntimeError('git-mv failed with status=0x%x' % status)
+
+
 def figure_out_what_to_change(dbdir):
   """Figures out what to change, but keeps the files and the database intact."""
+  os.environ.pop('GIT_DIR', None)  # Let git find .git on the filesystem.
+  calibre_path = calibre.__path__[0]
+  if not isinstance(calibre_path, str):
+    raise AssertionError(repr(calibre.__path__))
+  calibre_path = calibre_path.replace(os.sep, '/')
+  j = calibre_path.rfind('/lib/python')
+  if j < 0:
+    raise AssertionError
+  calibre_path = calibre_path[:j + 4].replace('/', os.sep)
+  ld_library_path = os.environ.get('LD_LIBRARY_PATH', '')
+  if ld_library_path:
+    # Remove the /lib, because git may be linked to a different zlib etc.
+    ld_library_path = os.pathsep.join(
+        dir_name for dir_name in ld_library_path.split(os.pathsep)
+        if dir_name != calibre_path)
+    os.environ['LD_LIBRARY_PATH'] = ld_library_path
+
   sqlite.Connection.create_dynamic_filter = _connection__create_dynamic_filter
   sqlite.Connection.commit = _connection__commit
   sqlite.Connection.real_commit = _connection__real_commit
@@ -427,6 +528,9 @@ def figure_out_what_to_change(dbdir):
   # to parsing them).
   print >>sys.stderr, 'info: Finding changed books in: ' + os.path.join(
       dbdir, 'metadata.db')
+  is_git = is_dir_in_git(dbdir)
+  if is_git:
+    print >>sys.stderr, 'info: Found Git repostiory.'
   fm = db.FIELD_MAP
   fm_path = fm['path']
   ids_to_delete_from_db = set()
@@ -435,7 +539,6 @@ def figure_out_what_to_change(dbdir):
   path_to_multiple_ids = {}
   file_ids_to_change = {}
   dirs_to_rename = {}
-  # TODO(pts): Also write missing metadata.opf files.
   for book_id in db.data._map:
     book_data = db.data._data[book_id]
     # Should it be encode_unicode instead? Doesn't seem to matter, because
@@ -496,7 +599,7 @@ def figure_out_what_to_change(dbdir):
   dbdir_sep = dbdir + os.sep
   fs_ext_dict = {}
   dotexts = frozenset('.' + extension for extension in EXTENSIONS)
-  unknown_book_file_count = 0
+  unknown_book_files = set()
   dbdir_git = os.path.join(dbdir, '.git')
   dbdir_git_sep = dbdir_git + os.sep
   dirpaths_to_ignore = (dbdir, dbdir_git)
@@ -517,10 +620,10 @@ def figure_out_what_to_change(dbdir):
       book_paths_without_opf.append(book_path)
     for filename in filenames:
       preext, ext = os.path.splitext(filename)
+      dirpathfile = os.path.join(dirpath, filename)
       if (ext in dotexts and filename not in ('cover.jpg', 'metadata.opf') and
           (is_mo or book_path in path_to_ids)):
-        pathname = os.path.join(dirpath, filename)
-        file_sizes[pathname] = os.stat(pathname).st_size
+        file_sizes[dirpathfile] = os.stat(dirpathfile).st_size
         fs_preexts = fs_ext_dict.get(dirpath)
         if fs_preexts is None:
           fs_preexts = fs_ext_dict[dirpath] = {}
@@ -530,9 +633,8 @@ def figure_out_what_to_change(dbdir):
         exts.append(ext)
       elif (filename not in ('cover.jpg', 'metadata.opf') and
             not filename.endswith('~')):
-        print >>sys.stderr, 'error: unknown book file: %s' % (
-            os.path.join(dirpath, filename))
-        unknown_book_file_count += 1
+        print >>sys.stderr, 'error: unknown book file: %s' % dirpathfile
+        unknown_book_files.add(dirpathfile)
   del book_dirs, dirpaths_to_ignore
   book_paths_without_opf.sort()
   for dirpath in sorted(fs_ext_dict):
@@ -550,9 +652,9 @@ def figure_out_what_to_change(dbdir):
     # Now fs_preexts contains the incorrect preexts.
     for preext in sorted(fs_preexts):
       for ext in fs_preexts[preext]:
-        print >>sys.stderr, 'error: unknown book file: %s' % (
-            os.path.join(dirpath, preext + ext))
-        unknown_book_file_count += 1
+        dirpathfile = os.path.join(dirpath, preext + ext)
+        print >>sys.stderr, 'error: unknown book file: %s' % dirpathfile
+        unknown_book_files.add(dirpathfile)
   fs_filename_dict = {}
   for dirpath in sorted(fs_ext_dict):
     fs_preexts = fs_ext_dict[dirpath]
@@ -576,7 +678,7 @@ def figure_out_what_to_change(dbdir):
       len(new_book_paths), ('y', 'ies')[len(new_book_paths) != 1],
       len(book_paths_without_opf),
       ('y', 'ies')[len(book_paths_without_opf) != 1],
-      unknown_book_file_count, 's' * (unknown_book_file_count != 1),
+      len(unknown_book_files), 's' * (len(unknown_book_files) != 1),
       len(fs_filename_dict), 's' * (fs_filename_dict != 1)))
 
   print >>sys.stderr, 'info: Reading book filename rows.'
@@ -626,24 +728,28 @@ def figure_out_what_to_change(dbdir):
   del db_filename_dict
 
   # TODO(pts): Return a helper object instead. Introduce a class.
-  return (db, book_data_deletes, book_data_inserts, book_data_updates,
+  return (is_git, db, book_data_deletes, book_data_inserts, book_data_updates,
           book_paths_without_opf, books_to_update, dirs_to_rename,
           file_ids_to_change, ids_to_delete_from_db, new_book_paths,
-          path_to_ids)
+          path_to_ids, unknown_book_files)
 
 
 def apply_db_and_fs_changes(
-    dbdir, db, book_data_deletes, book_data_inserts, book_data_updates,
+    dbdir, is_git, db, book_data_deletes, book_data_inserts, book_data_updates,
     book_paths_without_opf, books_to_update, dirs_to_rename, file_ids_to_change,
     ids_to_delete_from_db, new_book_paths, path_to_ids):
+  # Create missing metadata.opf files.
   for book_path in book_paths_without_opf:  # Already sorted.
     book_id = path_to_ids[book_path][0]
     # TODO(pts): Run `git add'.
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     opf_data = get_db_opf(db, book_id)
-    with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+    opf_filename = os.path.join(book_dir, 'metadata.opf')
+    with open(opf_filename, 'w') as f:
       f.write(opf_data)
       f.write('\n')
+    if is_git:
+      git_add(opf_filename)
 
   for book_id in sorted(file_ids_to_change):
     book_path, opf_data2 = file_ids_to_change[book_id]
@@ -652,6 +758,8 @@ def apply_db_and_fs_changes(
     with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
       f.write(opf_data2)
       f.write('\n')
+    if is_git:
+      git_add(opf_filename)
 
   # We must do this after having processed file_ids_to_change.
   old_path_to_ids = dict(path_to_ids)
@@ -662,7 +770,7 @@ def apply_db_and_fs_changes(
     path_to_ids[new_book_path] = path_to_ids.pop(book_path)
     # TODO(pts): Do a `git mv'?
     set_book_path_and_rename(db, dbdir, book_id, new_book_path,
-                             is_new_existing=False)
+                             is_new_existing=False, is_git=is_git)
 
   if ids_to_delete_from_db:
     # Type error in Python sqlite3:
@@ -702,6 +810,8 @@ def apply_db_and_fs_changes(
           with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
             f.write(odb_data)
             f.write('\n')
+        if is_git:
+          git_add(opf_filename)
     finally:
       if old_set_path is None:
         db.__dict__.pop('set_path', None)
@@ -772,7 +882,7 @@ def apply_db_and_fs_changes(
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
     force_book_id = new_book_path_to_id[book_path]
-    book_id = add_book(db, opf_data, force_book_id, book_path, dbdir)
+    book_id = add_book(db, opf_data, is_git, force_book_id, book_path, dbdir)
     old_path_to_ids[book_path] = ids = [book_id]
     match = TRAILING_BOOK_NUMBER_RE.search(book_path)
     if match:
@@ -781,7 +891,7 @@ def apply_db_and_fs_changes(
       force_book_path = '%s (%d)' % (book_path, force_book_id)
     if force_book_path != book_path:
       set_book_path_and_rename(db, dbdir, book_id, force_book_path,
-                               is_new_existing=False)
+                               is_new_existing=False, is_git=is_git)
       book_path = force_book_path
       book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     path_to_ids[force_book_path] = ids
@@ -799,6 +909,9 @@ def apply_db_and_fs_changes(
       with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
         f.write(odb_data)
         f.write('\n')
+    if is_git:
+      # Other files will be added by add_files_to_git.
+      git_add(os.path.join(book_dir, 'metadata.opf'))
 
   # Modify the data table.
   for book_path, format, name, data_id, uncompressed_size in book_data_updates:
@@ -829,9 +942,43 @@ def apply_db_and_fs_changes(
   # metadata_dirtied is populated by mutation methods of db.
   db.conn.execute('DELETE FROM metadata_dirtied')
   db.conn.real_commit()
-  db.conn.close()
-  send_message()  # Notify the Calibre GUI of the change.
-  print >>sys.stderr, 'info: Done.'
+
+
+def add_files_to_git(dbdir, unknown_book_files):
+  print >>sys.stderr, 'info: Adding all files to Git.'
+  git_add(os.path.join(dbdir, 'metadata.db'))
+  dbdir_sep = dbdir + os.sep
+  dotexts = frozenset('.' + extension for extension in EXTENSIONS)
+  dbdir_git = os.path.join(dbdir, '.git')
+  dbdir_git_sep = dbdir_git + os.sep
+  dirpaths_to_ignore = (dbdir, dbdir_git)
+  files_to_add = ['metadata.db']
+  total_added_file_size = os.stat(os.path.join(dbdir, 'metadata.db')).st_size
+  for dirpath, dirnames, filenames in os.walk(dbdir):
+    if dirpath in dirpaths_to_ignore or dirpath.startswith(dbdir_git_sep):
+      continue
+    if not dirpath.startswith(dbdir_sep):
+      raise AssertionError(dirpath, dbdir_sep)
+    book_path = dirpath[len(dbdir_sep):].replace(os.sep, '/')
+    if 'metadata.opf' in filenames:
+      for filename in filenames:
+        preext, ext = os.path.splitext(filename)
+        dirpathfile = os.path.join(dirpath, filename)
+        if ((ext in dotexts and dirpathfile not in unknown_book_files) or
+            filename in ('cover.jpg', 'metadata.opf')):
+          files_to_add.append(dirpathfile[len(dbdir_sep):])
+          total_added_file_size += os.stat(dirpathfile).st_size
+  files_to_add.sort()
+  # Some file may be up to data, but we count them anyway for simplicity.
+  # `git add' is very fast on them (based on timestamp, and then SHA-1).
+  print >>sys.stderr, 'info: Found %d file%s (%d byte%s) to (re)add to Git.' % (
+       len(files_to_add), 's' * (len(files_to_add) != 1),
+       total_added_file_size, 's' * (total_added_file_size != 1))
+  if files_to_add:  # Always true because of metadata.db.
+    status = call_xargs(
+        files_to_add, ('git', 'add', '--'), preexec_fn=lambda: os.chdir(dbdir))
+    if status:
+      raise RuntimeError('git-add failed with status=0x%x' % status)
 
 
 def main(argv):
@@ -862,10 +1009,10 @@ def main(argv):
   if not os.path.isfile(dbname):
     raise RuntimeError('Calibre database missing: %s' % dbname)
 
-  (db, book_data_deletes, book_data_inserts, book_data_updates,
+  (is_git, db, book_data_deletes, book_data_inserts, book_data_updates,
    book_paths_without_opf, books_to_update, dirs_to_rename,
    file_ids_to_change, ids_to_delete_from_db, new_book_paths,
-   path_to_ids) = figure_out_what_to_change(dbdir)
+   path_to_ids, unknown_book_files) = figure_out_what_to_change(dbdir)
 
   # No database or filesystem changes up to this point.
   if (ids_to_delete_from_db or books_to_update or file_ids_to_change or
@@ -873,11 +1020,22 @@ def main(argv):
       book_data_inserts or book_data_deletes or book_paths_without_opf):
     print >>sys.stderr, 'info: Applying database and filesystem changes.'
     apply_db_and_fs_changes(
-        dbdir, db, book_data_deletes, book_data_inserts, book_data_updates,
+        dbdir, is_git, db, book_data_deletes, book_data_inserts,
+        book_data_updates,
         book_paths_without_opf, books_to_update, dirs_to_rename,
         file_ids_to_change, ids_to_delete_from_db, new_book_paths, path_to_ids)
+    db.conn.close()
+    if is_git:
+      add_files_to_git(dbdir, unknown_book_files)
+    send_message()  # Notify the Calibre GUI of the change.
   else:
     print >>sys.stderr, 'info: Calibre database is up-to-date, nothing to do.'
+    db.conn.close()
+    if is_git:
+      add_files_to_git(dbdir, unknown_book_files)
+  # TODO(pts): Occasionally we get MM (not added to the index) changes on
+  #   metadata.db -- why?
+  print >>sys.stderr, 'info: Done.'
 
 
 if __name__ == '__main__':
