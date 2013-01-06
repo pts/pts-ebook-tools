@@ -412,23 +412,8 @@ def get_max_book_id(db, used_book_ids, max_book_id=None):
   return max_book_id
 
 
-def main(argv):
-  if (len(argv) > 1 and argv[1] in ('--help', '-h')):
-    print usage(argv[0])
-    sys.exit(0)
-  if len(argv) > 2:
-    print >>sys.stderr, usage()
-    sys.exit(1)
-  dbdir = argv[1].rstrip(os.sep) if len(argv) > 1 else '.'
-  if os.path.isfile(dbdir):
-    dbname = dbdir
-    dbdir = os.path.dirname(dbdir)
-  else:
-    dbname = os.path.join(dbdir, 'metadata.db')
-  print >>sys.stderr, 'info: Updating Calibre database: ' + dbname
-  if not os.path.isfile(dbname):
-    raise AssertionError('Calibre database missing: %s' % dbname)
-
+def figure_out_what_to_change(dbdir):
+  """Figures out what to change, but keeps the files and the database intact."""
   sqlite.Connection.create_dynamic_filter = _connection__create_dynamic_filter
   sqlite.Connection.commit = _connection__commit
   sqlite.Connection.real_commit = _connection__real_commit
@@ -440,7 +425,8 @@ def main(argv):
 
   # This is O(n), but fast, because generating .opf files is fast (as opposed
   # to parsing them).
-  print >>sys.stderr, 'info: Finding changed books in: ' + dbname
+  print >>sys.stderr, 'info: Finding changed books in: ' + os.path.join(
+      dbdir, 'metadata.db')
   fm = db.FIELD_MAP
   fm_path = fm['path']
   ids_to_delete_from_db = set()
@@ -547,8 +533,8 @@ def main(argv):
         print >>sys.stderr, 'error: unknown book file: %s' % (
             os.path.join(dirpath, filename))
         unknown_book_file_count += 1
+  del book_dirs, dirpaths_to_ignore
   book_paths_without_opf.sort()
-  del book_dirs
   for dirpath in sorted(fs_ext_dict):
     fs_preexts = fs_ext_dict[dirpath]
     if len(fs_preexts) <= 1:
@@ -602,6 +588,7 @@ def main(argv):
     raise RuntimeError('Unexpected fie;d names in the data table: '
                        'got=%s expected=%s' %
                        (','.join(fields), ','.join(expected_fields)))
+  del fields, expected_fields
   for row in c:
     book_id = row[1]
     # TODO(pts): Don't call encode_unicode_filesystem this often.
@@ -613,6 +600,7 @@ def main(argv):
       raise RuntimeError('Duplicate book file: book=%d format=%s' %
                          (row[1], row[2]))
     db_filename_dict[key] = value
+  del c
   book_data_updates = []
   book_data_inserts = []
   book_data_deletes = []
@@ -635,15 +623,19 @@ def main(argv):
       'will update %d, insert %d, delete %d.' %
       (len(db_filename_dict), 's' * (len(db_filename_dict) != 1),
        len(book_data_updates), len(book_data_inserts), len(book_data_deletes)))
+  del db_filename_dict
 
-  # No database or filesystem changes up to this point.
-  if not (ids_to_delete_from_db or books_to_update or file_ids_to_change or
-          dirs_to_rename or new_book_paths or book_data_updates or
-          book_data_inserts or book_data_deletes or book_paths_without_opf):
-    print >>sys.stderr, 'info: Calibre database is up-to-date, nothing to do.'
-    return
-  print >>sys.stderr, 'info: Applying database and filesystem changes.'
+  # TODO(pts): Return a helper object instead. Introduce a class.
+  return (db, book_data_deletes, book_data_inserts, book_data_updates,
+          book_paths_without_opf, books_to_update, dirs_to_rename,
+          file_ids_to_change, ids_to_delete_from_db, new_book_paths,
+          path_to_ids)
 
+
+def apply_db_and_fs_changes(
+    dbdir, db, book_data_deletes, book_data_inserts, book_data_updates,
+    book_paths_without_opf, books_to_update, dirs_to_rename, file_ids_to_change,
+    ids_to_delete_from_db, new_book_paths, path_to_ids):
   for book_path in book_paths_without_opf:  # Already sorted.
     book_id = path_to_ids[book_path][0]
     # TODO(pts): Run `git add'.
@@ -840,6 +832,52 @@ def main(argv):
   db.conn.close()
   send_message()  # Notify the Calibre GUI of the change.
   print >>sys.stderr, 'info: Done.'
+
+
+def main(argv):
+  """Main entry point for the script.
+
+  Don't call this function in a multithreaded application (such as Calibre),
+  it's not thread safe, because it makes non-thread-safe changes to some global
+  variables.
+  """
+  if (len(argv) > 1 and argv[1] in ('--help', '-h')):
+    print usage(argv[0])
+    sys.exit(0)
+  if len(argv) > 2:
+    print >>sys.stderr, usage()
+    sys.exit(1)
+  dbdir = argv[1].rstrip(os.sep) if len(argv) > 1 else '.'
+  if os.path.isfile(dbdir):
+    dbname = dbdir
+    dbdir = os.path.dirname(dbdir)
+    if os.path.basename(dbname) != 'metadata.db':
+      # We require this because of the database2.LibraryDatabase2(dbdir)
+      # constructor.
+      raise RuntimeError('The basename of the Calibre database must be '
+                         'metadata.db, got %r' % dbname)
+  else:
+    dbname = os.path.join(dbdir, 'metadata.db')
+  print >>sys.stderr, 'info: Updating Calibre database: ' + dbname
+  if not os.path.isfile(dbname):
+    raise RuntimeError('Calibre database missing: %s' % dbname)
+
+  (db, book_data_deletes, book_data_inserts, book_data_updates,
+   book_paths_without_opf, books_to_update, dirs_to_rename,
+   file_ids_to_change, ids_to_delete_from_db, new_book_paths,
+   path_to_ids) = figure_out_what_to_change(dbdir)
+
+  # No database or filesystem changes up to this point.
+  if (ids_to_delete_from_db or books_to_update or file_ids_to_change or
+      dirs_to_rename or new_book_paths or book_data_updates or
+      book_data_inserts or book_data_deletes or book_paths_without_opf):
+    print >>sys.stderr, 'info: Applying database and filesystem changes.'
+    apply_db_and_fs_changes(
+        dbdir, db, book_data_deletes, book_data_inserts, book_data_updates,
+        book_paths_without_opf, books_to_update, dirs_to_rename,
+        file_ids_to_change, ids_to_delete_from_db, new_book_paths, path_to_ids)
+  else:
+    print >>sys.stderr, 'info: Calibre database is up-to-date, nothing to do.'
 
 
 if __name__ == '__main__':
