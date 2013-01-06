@@ -6,8 +6,18 @@ exec calibre-debug -e "$0" ${1+"$@"}
 Don't run this script while somebody else (e.g. Calibre) is modifying the
 library. If you do anyway, you may lose some data. To be safe, exit from
 Calibre while this script is running.
-!! TODO(pts): Verify this claim, use EXCLUSIVE locking.
 
+This script modifies the filesystem as well in addition to the database,
+e.g. it renames book directories so that they include the book ID, changes
+the book ID in metadata.opf if there is a conflict etc. It tries to make as
+few changes as necessary.
+
+TODO(pts): Add the `git ...' commands to run.
+TODO(pts): Verify the locking claims, use EXCLUSIVE locking.
+TODO(pts): Do a a full database rebuild and then compare correctness.
+TODO(pts): This script is faster than expected at a full rebuild (after
+  DELETE FROM books; DELETE FROM authors; VACUUM) -- why? Why is the
+  metadata.db >= 128K even then?
 TODO(pts): Add documentation when to exit from Calibre. Is an exit needed?
 TODO(pts): Disallow processing books with an older version of Calibre.
 TODO(pts): Add rebuild_db.py to another repository, indicate that it's
@@ -430,7 +440,6 @@ def main(argv):
 
   # This is O(n), but fast, because generating .opf files is fast (as opposed
   # to parsing them).
-  # TODO(pts): Ignore calibre version number changes etc.
   print >>sys.stderr, 'info: Finding changed books in: ' + dbname
   fm = db.FIELD_MAP
   fm_path = fm['path']
@@ -506,6 +515,7 @@ def main(argv):
   dbdir_git_sep = dbdir_git + os.sep
   dirpaths_to_ignore = (dbdir, dbdir_git)
   file_sizes = {}
+  book_paths_without_opf = []
   for dirpath, dirnames, filenames in os.walk(dbdir):
     if dirpath in dirpaths_to_ignore or dirpath.startswith(dbdir_git_sep):
       continue
@@ -517,7 +527,8 @@ def main(argv):
       if dirpath not in book_dirs:
         # TODO(pts): Try to match it with an existing book by UUID.
         new_book_paths.add(book_path)
-
+    elif dirpath in book_dirs:
+      book_paths_without_opf.append(book_path)
     for filename in filenames:
       preext, ext = os.path.splitext(filename)
       if (ext in dotexts and filename not in ('cover.jpg', 'metadata.opf') and
@@ -536,6 +547,7 @@ def main(argv):
         print >>sys.stderr, 'error: unknown book file: %s' % (
             os.path.join(dirpath, filename))
         unknown_book_file_count += 1
+  book_paths_without_opf.sort()
   del book_dirs
   for dirpath in sorted(fs_ext_dict):
     fs_preexts = fs_ext_dict[dirpath]
@@ -572,9 +584,12 @@ def main(argv):
         fs_filename_dict[key] = value
   del file_sizes
   print >>sys.stderr, (
-      'info: Found %d new book director%s, %d unknown book file%s and '
+      'info: Found %d new book director%s, %d old book director%s with '
+      'metadata.opf missing, %d unknown book file%s and '
       '%d book file%s.' % (
       len(new_book_paths), ('y', 'ies')[len(new_book_paths) != 1],
+      len(book_paths_without_opf),
+      ('y', 'ies')[len(book_paths_without_opf) != 1],
       unknown_book_file_count, 's' * (unknown_book_file_count != 1),
       len(fs_filename_dict), 's' * (fs_filename_dict != 1)))
 
@@ -624,12 +639,19 @@ def main(argv):
   # No database or filesystem changes up to this point.
   if not (ids_to_delete_from_db or books_to_update or file_ids_to_change or
           dirs_to_rename or new_book_paths or book_data_updates or
-          book_data_inserts or book_data_deletes):
+          book_data_inserts or book_data_deletes or book_paths_without_opf):
     print >>sys.stderr, 'info: Calibre database is up-to-date, nothing to do.'
     return
-
-  # TODO(pts): Verify this claim.
   print >>sys.stderr, 'info: Applying database and filesystem changes.'
+
+  for book_path in book_paths_without_opf:  # Already sorted.
+    book_id = path_to_ids[book_path][0]
+    # TODO(pts): Run `git add'.
+    book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    opf_data = get_db_opf(db, book_id)
+    with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+      f.write(opf_data)
+      f.write('\n')
 
   for book_id in sorted(file_ids_to_change):
     book_path, opf_data2 = file_ids_to_change[book_id]
@@ -808,6 +830,7 @@ def main(argv):
     # TODO(pts): Test this.
     db.conn.execute('DELETE FROM data WHERE id IN (%s)' % ','.join(map(
         str, (data_id for _, _, data_id in book_data_deletes))))
+  # TODO(pts): Modify the corresponding in-memory fields in db.data._data.
 
   # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
   # create the metadata.opf files for books listed in metadata_dirtied.
@@ -816,8 +839,6 @@ def main(argv):
   db.conn.real_commit()
   db.conn.close()
   send_message()  # Notify the Calibre GUI of the change.
-  # !! TODO(pts): Do a a full database rebuild and then compare correctness.
-  # !! TODO(pts): Write the missing metadata.opf files.
   print >>sys.stderr, 'info: Done.'
 
 
