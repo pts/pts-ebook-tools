@@ -3,6 +3,9 @@
 
 exec calibre-debug -e "$0" ${1+"$@"}
 
+Run this script after a `git pull' or `git fetch' to resolve conflicts in
+metadata.db by updating it from individual metadata.opf files.
+
 Don't run this script while somebody else (e.g. Calibre) is modifying the
 library. If you do anyway, you may lose some data. To be safe, exit from
 Calibre while this script is running.

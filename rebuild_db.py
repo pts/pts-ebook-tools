@@ -3,6 +3,8 @@
 
 exec calibre-debug -e "$0" ${1+"$@"}
 
+This script is experimental, please don't run it!
+
 Don't run this script while somebody else (e.g. Calibre) is modifying the
 library. If you do anyway, you may lose some data. To be safe, exit from
 Calibre while this script is running.
