@@ -8,7 +8,10 @@ library. If you do anyway, you may lose some data. To be safe, exit from
 Calibre while this script is running.
 !! TODO(pts): Verify this claim, use EXCLUSIVE locking.
 
-TODO(pts): Renumber books with a conflicting ID.
+TODO(pts): Add documentation when to exit from Calibre. Is an exit needed?
+TODO(pts): Disallow processing books with an older version of Calibre.
+TODO(pts): Add rebuild_db.py to another repository, indicate that it's
+  incorrect.
 """
 
 # by pts@fazekas.hu at Wed Dec 26 12:54:02 CET 2012
@@ -609,6 +612,8 @@ def main(argv):
       book_data_inserts.append(key + (fs_value[0], fs_value[2]))  # (book_path, format, name, uncompressed_size).
   for key in sorted(db_filename_dict):
     if key not in fs_filename_dict:
+      # TODO(pts): As a speed optimization, don't delete files if the whole book
+      # is deleted, because the trigger deletes the files.
       book_data_deletes.append(key + (db_filename_dict[key][1],))  # (book_path, format, data_id).
   print >>sys.stderr, (
       'info: Found %s book filename row%s; '
@@ -674,8 +679,9 @@ def main(argv):
         # end (db.conn.real_commit).
         db.set_metadata(book_id, mi, force_changes=True)
         opf_data = opf_data.replace('\r\n', '\n').rstrip('\r\n')
-        odb_data = replace_first_match(
-            get_db_opf(db, book_id), opf_data, CALIBRE_CONTRIBUTOR_RE)
+        odb_data = get_db_opf(db, book_id)
+        opf_data = replace_first_match(
+            opf_data, odb_data, CALIBRE_CONTRIBUTOR_RE)
         # This can happen e.g. if the author (<dc:creator) is changed, then
         # Calibre replaces name="calibre:author_link_map".
         if opf_data != odb_data:
@@ -751,11 +757,6 @@ def main(argv):
   for book_path in sorted(new_book_paths):
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
-    id_match = CALIBRE_IDENTIFIER_RE.search(opf_data)
-    if id_match is None:
-      opf_book_id = None
-    else:
-      opf_book_id = int(id_match.group(1))
     force_book_id = new_book_path_to_id[book_path]
     book_id = add_book(db, opf_data, force_book_id, book_path, dbdir)
     old_path_to_ids[book_path] = ids = [book_id]
@@ -770,13 +771,20 @@ def main(argv):
       book_path = force_book_path
       book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     path_to_ids[force_book_path] = ids
-    if opf_book_id != book_id:
-      opf_data2 = '%s%d%s' % (opf_data[:id_match.start(1)], book_id,
-                              opf_data[id_match.end(1):])
+    odb_data = get_db_opf(db, book_id)
+    opf_data = opf_data.replace('\r\n', '\n').rstrip('\r\n')
+    opf_data2 = replace_first_match(  # get_db_opf returns correct book_id.
+        opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
+    opf_data3 = replace_first_match(
+        opf_data2, odb_data, CALIBRE_CONTRIBUTOR_RE)
+    # This can happen e.g. whern <dc:language is changed from en to eng because
+    # of a Calibre version upgrade.
+    if opf_data != odb_data:
+      if opf_data3 == odb_data:
+        odb_data = opf_data2  # Keep the original Calibre contributor version.
       with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
-        f.write(opf_data2)
+        f.write(odb_data)
         f.write('\n')
-      opf_data = opf_data2
 
   # Modify the data table.
   for book_path, format, name, data_id, uncompressed_size in book_data_updates:
@@ -810,9 +818,6 @@ def main(argv):
   send_message()  # Notify the Calibre GUI of the change.
   # !! TODO(pts): Do a a full database rebuild and then compare correctness.
   # !! TODO(pts): Write the missing metadata.opf files.
-  # !! TODO(pts): Why do we have 3 data row updates after the first run?
-  # TODO(pts): Add rebuild_db.py to another repository, indicate that it's
-  # incorrect.
   print >>sys.stderr, 'info: Done.'
 
 
