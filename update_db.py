@@ -625,7 +625,7 @@ def main(argv):
   if not (ids_to_delete_from_db or books_to_update or file_ids_to_change or
           dirs_to_rename or new_book_paths or book_data_updates or
           book_data_inserts or book_data_deletes):
-    print >>sys.stderr, 'info: Nothing to modify.'
+    print >>sys.stderr, 'info: Calibre database is up-to-date, nothing to do.'
     return
 
   # TODO(pts): Verify this claim.
