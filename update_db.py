@@ -496,6 +496,7 @@ def git_checkout(filename, preargs=()):
 def git_status_s(filename):
   p = subprocess.Popen(
       ('git', 'status', '-s', '--', os.path.basename(filename)),
+      stdout=subprocess.PIPE,
       preexec_fn=lambda: os.chdir(os.path.dirname(filename)))
   try:
     stdout, stderr = p.communicate()
