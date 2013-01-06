@@ -16,7 +16,6 @@ This script runs `git add' on all files (metadata.db, metadata.opf,
 cover.jpg and book data files) in the Calibre library if it finds that the
 library is in a Git repository.
 
-TODO(pts): Restore metadata.db to the version before the merge conflict.
 TODO(pts): Verify the locking claims, use EXCLUSIVE locking.
 TODO(pts): Do a a full database rebuild and then compare correctness.
 TODO(pts): This script is faster than expected at a full rebuild (after
@@ -479,6 +478,42 @@ def git_add(filename):
     raise RuntimeError('git-add failed with status=0x%x' % status)
 
 
+def git_checkout(filename, preargs=()):
+  basename = os.path.basename(filename)
+  if preargs:
+    cmd = ('git', 'checkout') + tuple(preargs) + ('--', basename)
+  else:
+    cmd = ('git', 'checkout', '--', basename)
+  status = subprocess.call(
+      cmd, preexec_fn=lambda: os.chdir(os.path.dirname(filename)))
+  if status:
+    raise RuntimeError('git-checkout failed with status=0x%x' % status)
+
+
+def git_status_s(filename):
+  p = subprocess.Popen(
+      ('git', 'status', '-s', '--', os.path.basename(filename)),
+      preexec_fn=lambda: os.chdir(os.path.dirname(filename)))
+  try:
+    stdout, stderr = p.communicate()
+  finally:
+    status = p.wait()
+  if status:
+    raise RuntimeError('git-status failed with status=0x%x' % status)
+  if stdout:
+    if len(stdout) < 3 or stdout[2] != ' ':
+      raise RuntimeError('Unexpectd git-status output: %r' % stdout)
+    return stdout[:2]
+  else:
+    return ''  # Unchanged.
+
+
+def is_git_status_unmerged_conflict(status_s):
+  """Takes the return value of git_status_s."""
+  # See `git help status' for all possible `unmerged' combinations.
+  return ('U' in status_s and status_s != 'DU') or status_s == 'AA'
+
+
 def git_mv(oldname, newname):
   olds = oldname.split(os.sep)
   news = newname.split(os.sep)
@@ -496,8 +531,7 @@ def git_mv(oldname, newname):
     raise RuntimeError('git-mv failed with status=0x%x' % status)
 
 
-def figure_out_what_to_change(dbdir):
-  """Figures out what to change, but keeps the files and the database intact."""
+def setup_git():
   os.environ.pop('GIT_DIR', None)  # Let git find .git on the filesystem.
   calibre_path = calibre.__path__[0]
   if not isinstance(calibre_path, str):
@@ -515,6 +549,9 @@ def figure_out_what_to_change(dbdir):
         if dir_name != calibre_path)
     os.environ['LD_LIBRARY_PATH'] = ld_library_path
 
+
+def figure_out_what_to_change(dbdir, is_git):
+  """Figures out what to change, but keeps the files and the database intact."""
   sqlite.Connection.create_dynamic_filter = _connection__create_dynamic_filter
   sqlite.Connection.commit = _connection__commit
   sqlite.Connection.real_commit = _connection__real_commit
@@ -528,9 +565,6 @@ def figure_out_what_to_change(dbdir):
   # to parsing them).
   print >>sys.stderr, 'info: Finding changed books in: ' + os.path.join(
       dbdir, 'metadata.db')
-  is_git = is_dir_in_git(dbdir)
-  if is_git:
-    print >>sys.stderr, 'info: Found Git repostiory.'
   fm = db.FIELD_MAP
   fm_path = fm['path']
   ids_to_delete_from_db = set()
@@ -728,7 +762,7 @@ def figure_out_what_to_change(dbdir):
   del db_filename_dict
 
   # TODO(pts): Return a helper object instead. Introduce a class.
-  return (is_git, db, book_data_deletes, book_data_inserts, book_data_updates,
+  return (db, book_data_deletes, book_data_inserts, book_data_updates,
           book_paths_without_opf, books_to_update, dirs_to_rename,
           file_ids_to_change, ids_to_delete_from_db, new_book_paths,
           path_to_ids, unknown_book_files)
@@ -804,10 +838,11 @@ def apply_db_and_fs_changes(
         odb_data = get_db_opf(db, book_id)
         opf_data = replace_first_match(
             opf_data, odb_data, CALIBRE_CONTRIBUTOR_RE)
+        opf_filename = os.path.join(book_dir, 'metadata.opf')
         # This can happen e.g. if the author (<dc:creator) is changed, then
         # Calibre replaces name="calibre:author_link_map".
         if opf_data != odb_data:
-          with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+          with open(opf_filename, 'w') as f:
             f.write(odb_data)
             f.write('\n')
         if is_git:
@@ -1007,12 +1042,23 @@ def main(argv):
     dbname = os.path.join(dbdir, 'metadata.db')
   print >>sys.stderr, 'info: Updating Calibre database: ' + dbname
   if not os.path.isfile(dbname):
-    raise RuntimeError('Calibre database missing: %s' % dbname)
+    raise RuntimeError('Calibre database missing: ' + dbname)
 
-  (is_git, db, book_data_deletes, book_data_inserts, book_data_updates,
+  setup_git()
+  # TODO(pts): Fail if there is .git, but the 'git' command doesn't work.
+  is_git = is_dir_in_git(dbdir)
+  if is_git:
+    print >>sys.stderr, 'info: Found Git repostiory.'
+    status_s = git_status_s(dbname)
+    if is_git_status_unmerged_conflict(status_s):
+      print >>sys.stderr, (
+          'info: Resolving conflict in metadata.db by ignoring their changes.')
+      git_checkout(dbname, ('HEAD',))
+
+  (db, book_data_deletes, book_data_inserts, book_data_updates,
    book_paths_without_opf, books_to_update, dirs_to_rename,
    file_ids_to_change, ids_to_delete_from_db, new_book_paths,
-   path_to_ids, unknown_book_files) = figure_out_what_to_change(dbdir)
+   path_to_ids, unknown_book_files) = figure_out_what_to_change(dbdir, is_git)
 
   # No database or filesystem changes up to this point.
   if (ids_to_delete_from_db or books_to_update or file_ids_to_change or
@@ -1036,6 +1082,8 @@ def main(argv):
   # TODO(pts): Occasionally we get MM (not added to the index) changes on
   #   metadata.db -- why?
   print >>sys.stderr, 'info: Done.'
+  if is_git:
+    print >>sys.stderr, 'info: Do not forget to run: git commit -m update'
 
 
 if __name__ == '__main__':
