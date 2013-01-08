@@ -19,6 +19,8 @@ This script runs `git add' on all files (metadata.db, metadata.opf,
 cover.jpg and book data files) in the Calibre library if it finds that the
 library is in a Git repository.
 
+TODO(pts): Add command-line flags to rename directories (e.g. _ -> ,).
+TODO(pts): ``197 book rows to update'' after adding tags -- why?
 TODO(pts): Verify the locking claims, use EXCLUSIVE locking.
 TODO(pts): Do a a full database rebuild and then compare correctness.
 TODO(pts): This script is faster than expected at a full rebuild (after
