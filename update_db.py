@@ -19,8 +19,9 @@ This script runs `git add' on all files (metadata.db, metadata.opf,
 cover.jpg and book data files) in the Calibre library if it finds that the
 library is in a Git repository.
 
+TODO(pts): Verify that Calibre is not running in this directory, possibly stop
+  it or lock it?
 TODO(pts): Add command-line flags to rename directories (e.g. _ -> ,).
-TODO(pts): ``197 book rows to update'' after adding tags -- why?
 TODO(pts): Verify the locking claims, use EXCLUSIVE locking.
 TODO(pts): Do a a full database rebuild and then compare correctness.
 TODO(pts): This script is faster than expected at a full rebuild (after
@@ -556,8 +557,7 @@ def setup_git():
     os.environ['LD_LIBRARY_PATH'] = ld_library_path
 
 
-def figure_out_what_to_change(dbdir, is_git):
-  """Figures out what to change, but keeps the files and the database intact."""
+def open_db(dbdir):
   sqlite.Connection.create_dynamic_filter = _connection__create_dynamic_filter
   sqlite.Connection.commit = _connection__commit
   sqlite.Connection.real_commit = _connection__real_commit
@@ -565,7 +565,11 @@ def figure_out_what_to_change(dbdir, is_git):
   # This is O(n), it reads the whole book database to db.data.
   # TODO(pts): Calls dbdir.decode(filesystem_encoding), fix it.
   # TODO(pts): Why are there 4 commits in the beginning?
-  db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
+  return database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
+
+
+def figure_out_what_to_change(db, dbdir, is_git):
+  """Figures out what to change, but keeps the files and the database intact."""
 
   # This is O(n), but fast, because generating .opf files is fast (as opposed
   # to parsing them).
@@ -768,7 +772,7 @@ def figure_out_what_to_change(dbdir, is_git):
   del db_filename_dict
 
   # TODO(pts): Return a helper object instead. Introduce a class.
-  return (db, book_data_deletes, book_data_inserts, book_data_updates,
+  return (book_data_deletes, book_data_inserts, book_data_updates,
           book_paths_without_opf, books_to_update, dirs_to_rename,
           file_ids_to_change, ids_to_delete_from_db, new_book_paths,
           path_to_ids, unknown_book_files)
@@ -778,10 +782,15 @@ def apply_db_and_fs_changes(
     dbdir, is_git, db, book_data_deletes, book_data_inserts, book_data_updates,
     book_paths_without_opf, books_to_update, dirs_to_rename, file_ids_to_change,
     ids_to_delete_from_db, new_book_paths, path_to_ids):
+  dirtied_count = list(db.conn.execute(
+      'SELECT COUNT(*) FROM metadata_dirtied'))[0][0]
+  if dirtied_count:
+    raise RuntimeError('%d book%s initially dirty.' % (
+        dirtied_count, 's' * (dirtied_count != 1)))
+
   # Create missing metadata.opf files.
   for book_path in book_paths_without_opf:  # Already sorted.
     book_id = path_to_ids[book_path][0]
-    # TODO(pts): Run `git add'.
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     opf_data = get_db_opf(db, book_id)
     opf_filename = os.path.join(book_dir, 'metadata.opf')
@@ -978,10 +987,11 @@ def apply_db_and_fs_changes(
         str, (data_id for _, _, data_id in book_data_deletes))))
   # TODO(pts): Modify the corresponding in-memory fields in db.data._data.
 
-  # The alternative, db.dump_metadata() (also known as write_dirtied(db)) would
-  # create the metadata.opf files for books listed in metadata_dirtied.
-  # metadata_dirtied is populated by mutation methods of db.
-  db.conn.execute('DELETE FROM metadata_dirtied')
+  dirtied_count = list(db.conn.execute(
+      'SELECT COUNT(*) FROM metadata_dirtied'))[0][0]
+  if dirtied_count:
+    raise RuntimeError('%d book%s still dirty.' % (
+        dirtied_count, 's' * (dirtied_count != 1)))
   db.conn.real_commit()
 
 
@@ -1020,6 +1030,58 @@ def add_files_to_git(dbdir, unknown_book_files):
         files_to_add, ('git', 'add', '--'), preexec_fn=lambda: os.chdir(dbdir))
     if status:
       raise RuntimeError('git-add failed with status=0x%x' % status)
+
+
+def safe_write_dirtied(db, dbdir, is_git):
+  """Write metadata.opf files (based on the database) for dirty books."""
+  # This method is like db.dump_metadata() or write_dirtied(...) in the
+  # calibredb tool, but will try to be smarter on conflicts.
+  dirty_book_ids = sorted(book_id for book_id, in
+                          db.conn.execute('SELECT book FROM metadata_dirtied'))
+  if not dirty_book_ids:
+    return
+  print >>sys.stderr, (
+      'info: Found %d dirty book%s, generating their metadata.' %
+      (len(dirty_book_ids), 's' * (len(dirty_book_ids) != 1)))
+  files_to_write = []
+  files_modified_in_git = []
+  fm = db.FIELD_MAP
+  fm_path = fm['path']
+  for book_id in dirty_book_ids:
+    book_path = encode_unicode_filesystem(db.data._data[book_id][fm_path])
+    book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
+    opf_data = get_db_opf(db, book_id)
+    opf_filename = os.path.join(book_dir, 'metadata.opf')
+    # TODO(pts): Calling git_status_s so many times is very slow. Use
+    # call_xargs to speed it up.
+    if is_git and git_status_s(opf_filename):
+      files_modified_in_git.append(opf_filename)
+    else:
+      files_to_write.append((opf_filename, opf_data))
+  if files_modified_in_git:
+    # TODO(pts): Do something smarter here in the most common case (git
+    # merge).
+    msg = 'Found %d dirty book%s also modified in Git' % (
+        len(files_modified_in_git), 's' * (len(files_modified_in_git) != 1))
+    print >>sys.stderr, 'info: %s: %r' % (msg, sorted(files_modified_in_git))
+    raise RuntimeError(msg + ', see above.')
+  if files_to_write:
+    print >>sys.stderr, (
+        'info: Found %d dirty book%s, writing their metadata.opf.' %
+        (len(files_to_write), 's' * (len(files_to_write) != 1)))
+    for opf_filename, opf_data in files_to_write:
+      with open(opf_filename, 'w') as f:
+        f.write(opf_data)
+        f.write('\n')
+      if is_git:
+        git_add(opf_filename)
+    db.conn.execute('DELETE FROM metadata_dirtied')
+    # Commit because we don't want to roll back the DELETE above later,
+    # because that would make the filesystem and the database more
+    # inconsistent, and it would make conflicts harder to resolve.
+    #
+    # TODO(pts): Do we still keep the database locked after the commit?
+    db.conn.real_commit()
 
 
 def main(argv):
@@ -1061,10 +1123,19 @@ def main(argv):
           'info: Resolving conflict in metadata.db by ignoring their changes.')
       git_checkout(dbname, ('HEAD',))
 
-  (db, book_data_deletes, book_data_inserts, book_data_updates,
+  db = open_db(dbdir)
+
+  # We have to do it in case lots of metadata changes were done in Calibre, but
+  # Calibre was closed before it could write all metadata.opf files to disk.
+  # (It's writing them very slowly, because that's throttled.) The
+  # metadata_dirtied table contains the book IDs to write.
+  safe_write_dirtied(db, dbdir, is_git)
+
+  (book_data_deletes, book_data_inserts, book_data_updates,
    book_paths_without_opf, books_to_update, dirs_to_rename,
    file_ids_to_change, ids_to_delete_from_db, new_book_paths,
-   path_to_ids, unknown_book_files) = figure_out_what_to_change(dbdir, is_git)
+   path_to_ids, unknown_book_files) = figure_out_what_to_change(
+       db, dbdir, is_git)
 
   # No database or filesystem changes up to this point.
   if (ids_to_delete_from_db or books_to_update or file_ids_to_change or
