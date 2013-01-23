@@ -19,6 +19,8 @@ This script runs `git add' on all files (metadata.db, metadata.opf,
 cover.jpg and book data files) in the Calibre library if it finds that the
 library is in a Git repository.
 
+TODO(pts): How does Calibre handle unknown extensions (e.g. .doc)? Our script
+  just ignores those files.
 TODO(pts): Verify that Calibre is not running in this directory, possibly stop
   it or lock it?
 TODO(pts): Add command-line flags to rename directories (e.g. _ -> ,).
@@ -260,16 +262,20 @@ def add_book(db, opf_data, is_git,
   # Parsing .opf files is the slowest per-book step.
   mi = opf2.OPF(cStringIO.StringIO(opf_data)).to_book_metadata()
   cover_href = None
-  for guide in mi._data['guide']:
-    if guide.type == 'cover':
-      cover_href = guide.href()
-      break
-  if cover_href and '/' in cover_href:
-    raise AssertionError(repr(cover_href))
-  # TODO(pts): rename cover_href to cover.jpg
-  #print dir(mi._data['guide'])
-  mi._data['guide']._resources[:] = [
-     x for x in mi._data['guide']._resources if x.type != 'cover']
+  if getattr(mi._data, 'guide', None):  # Not in Calibre 0.9.13 anymore.
+    for guide in mi._data['guide']:
+      if guide.type == 'cover':
+        cover_href = guide.href()
+        break
+    if cover_href and '/' in cover_href:
+      raise AssertionError(repr(cover_href))
+    # TODO(pts): rename cover_href to cover.jpg
+    #print dir(mi._data['guide'])
+    mi._data['guide']._resources[:] = [
+       x for x in mi._data['guide']._resources if x.type != 'cover']
+  else:
+    if mi.cover_data[0]:  # TODO(pts): Is it good enough?
+      cover_href = '.'
   mi.cover_data = (None, None)
   mi.has_cover = False
   mi.cover = None
@@ -565,7 +571,9 @@ def open_db(dbdir):
   # This is O(n), it reads the whole book database to db.data.
   # TODO(pts): Calls dbdir.decode(filesystem_encoding), fix it.
   # TODO(pts): Why are there 4 commits in the beginning?
-  return database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
+  db = database2.LibraryDatabase2(dbdir)  # Slow, reads metadata.db.
+  db.dirtied = lambda *args, **kwargs: None  # We save .opf files manually.
+  return db
 
 
 def figure_out_what_to_change(db, dbdir, is_git):
