@@ -19,6 +19,7 @@ This script runs `git add' on all files (metadata.db, metadata.opf,
 cover.jpg and book data files) in the Calibre library if it finds that the
 library is in a Git repository.
 
+TODO(pts): `git add' the deletion of cover.jpg (happened in Calibre).
 TODO(pts): How does Calibre handle unknown extensions (e.g. .doc)? Our script
   just ignores those files.
 TODO(pts): Verify that Calibre is not running in this directory, possibly stop
