@@ -33,6 +33,8 @@ TODO(pts): Add documentation when to exit from Calibre. Is an exit needed?
 TODO(pts): Disallow processing books with an older version of Calibre.
 TODO(pts): Add rebuild_db.py to another repository, indicate that it's
   incorrect.
+TODO(pts): Why so many updates at biglib 51959df? Should be 0.
+  info: Found 2448 book rows, 0 book rows to delete, 1280 book rows to update, 0 file IDs to change and 0 directories to rename.
 """
 
 # by pts@fazekas.hu at Wed Dec 26 12:54:02 CET 2012
@@ -1056,6 +1058,9 @@ def safe_write_dirtied(db, dbdir, is_git):
   fm = db.FIELD_MAP
   fm_path = fm['path']
   for book_id in dirty_book_ids:
+    assert book_id < len(db.data._data), (book_id, len(db.data._data))
+    if db.data._data[book_id] is None:
+      continue
     book_path = encode_unicode_filesystem(db.data._data[book_id][fm_path])
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     opf_data = get_db_opf(db, book_id)
@@ -1069,6 +1074,9 @@ def safe_write_dirtied(db, dbdir, is_git):
   if files_modified_in_git:
     # TODO(pts): Do something smarter here in the most common case (git
     # merge).
+    # TODO(pts): Do something smarter here after a long calibre run which has
+    #   made many modifications. At least add an option to skip this error.
+    #   This is an important show-stopper bug.
     msg = 'Found %d dirty book%s also modified in Git' % (
         len(files_modified_in_git), 's' * (len(files_modified_in_git) != 1))
     print >>sys.stderr, 'info: %s: %r' % (msg, sorted(files_modified_in_git))
