@@ -874,7 +874,8 @@ def apply_db_and_fs_changes(
     book_path, opf_data2 = file_ids_to_change[book_id]
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     # TODO(pts): Open all files in binary mode?
-    with open(os.path.join(book_dir, 'metadata.opf'), 'w') as f:
+    opf_filename = os.path.join(book_dir, 'metadata.opf')
+    with open(opf_filename, 'w') as f:
       f.write(opf_data2)
       f.write('\n')
     if is_git:
