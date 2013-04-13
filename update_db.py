@@ -36,8 +36,7 @@ TODO(pts): Add documentation when to exit from Calibre. Is an exit needed?
 TODO(pts): Disallow processing books with an older version of Calibre.
 TODO(pts): Add rebuild_db.py to another repository, indicate that it's
   incorrect.
-TODO(pts): Why so many updates at biglib 51959df? Should be 0.
-  info: Found 2448 book rows, 0 book rows to delete, 1280 book rows to update, 0 file IDs to change and 0 directories to rename.
+TODO(pts): What if metadata.opf contains a nonexisting cover.jpg?
 """
 
 # by pts@fazekas.hu at Wed Dec 26 12:54:02 CET 2012
@@ -582,6 +581,21 @@ def open_db(dbdir):
   return db
 
 
+OPF_DC_SUBJECT_RE = re.compile(r'(?sm)^ *<dc:subject>.*</dc:subject>(?=\n)')
+"""Matches the block of <dc:subject>... lines (multiline) in an .opf."""
+
+
+def sort_dc_subject(opf_data):
+  """Sorts the <dc:subject>... lines on an .opf file content."""
+  match = OPF_DC_SUBJECT_RE.search(opf_data)
+  if not match:
+    return opf_data
+  return '%s%s%s' % (
+      opf_data[:match.start()],
+      '\n'.join(sorted(match.group().split('\n'))),  # Sorted <dc:subject>s.
+      opf_data[match.end():])
+
+
 def figure_out_what_to_change(db, dbdir, is_git):
   """Figures out what to change, but keeps the files and the database intact."""
 
@@ -620,11 +634,13 @@ def figure_out_what_to_change(db, dbdir, is_git):
           # TODO(pts): If the UUID is different (e.g.
           #            <dc:identifier opf:scheme="uuid" id="uuid_id">),
           #            should we treat them as two different books?
-          odb_data = replace_first_match(
-              odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE)
+          # We call sort_dc_subject so that a difference in the tag order won't
+          # make the books different.
+          odb_data = sort_dc_subject(replace_first_match(
+              odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE))
           if opf_data != odb_data:
-            opf_data2 = replace_first_match(
-                opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
+            opf_data2 = sort_dc_subject(replace_first_match(
+                opf_data, odb_data, CALIBRE_IDENTIFIER_RE))
             if opf_data2 == odb_data:
               file_ids_to_change[book_id] = (book_path, opf_data2)
             else:
