@@ -143,8 +143,9 @@ def escape_sqlite_name(name):
 
 
 def usage(argv0):
-  return ('Rebuilds (parts of) metadata.db from the metadata.opf files.\n'
-          'Usage: %s [<calibre-library-dir>]' % argv0)
+  return ('Updates (parts of) metadata.db from the metadata.opf files.\n'
+          'Usage: %s [--half-dry-run] [<calibre-library-dir>]\n'
+          '--half-dry-run only saves dirty db books to metadata.opf' % argv0)
 
 
 def get_extensions(builtins_module):
@@ -1113,10 +1114,30 @@ def main(argv):
   if (len(argv) > 1 and argv[1] in ('--help', '-h')):
     print usage(argv[0])
     sys.exit(0)
-  if len(argv) > 2:
-    print >>sys.stderr, usage()
+  i = 1
+  do_half_dry_run = False
+  while i < len(argv):
+    arg = argv[i]
+    if arg == '--':
+      i += 1
+      break
+    if arg == '-' or not arg.startswith('-'):
+      break
+    if arg == '--half-dry-run':
+      do_half_dry_run = True
+    else:
+      print >>sys.stderr, '%s\n\nerror: Unknown flag: %s' % (
+          usage(argv[0]), arg)
+      sys.exit(1)
+    i += 1
+  if i == len(argv):
+    dbdir = '.'
+  elif i == len(argv) - 1:
+    dbdir = argv[i]
+  else:
+    print >>sys.stderr, '%s\n\nerror: Too many command-line arguments.' % (
+        usage(argv[0]))
     sys.exit(1)
-  dbdir = argv[1].rstrip(os.sep) if len(argv) > 1 else '.'
   if os.path.isfile(dbdir):
     dbname = dbdir
     dbdir = os.path.dirname(dbdir)
@@ -1135,7 +1156,8 @@ def main(argv):
   # TODO(pts): Fail if there is .git, but the 'git' command doesn't work.
   is_git = is_dir_in_git(dbdir)
   if is_git:
-    print >>sys.stderr, 'info: Found Git repostiory.'
+    print >>sys.stderr, (
+        'info: Found Git repository, scanning working tree for file changes.')
     status_s = git_status_s(dbname)
     if is_git_status_unmerged_conflict(status_s):
       print >>sys.stderr, (
@@ -1160,27 +1182,32 @@ def main(argv):
   if (ids_to_delete_from_db or books_to_update or file_ids_to_change or
       dirs_to_rename or new_book_paths or book_data_updates or
       book_data_inserts or book_data_deletes or book_paths_without_opf):
-    print >>sys.stderr, 'info: Applying database and filesystem changes.'
-    apply_db_and_fs_changes(
-        dbdir, is_git, db, book_data_deletes, book_data_inserts,
-        book_data_updates,
-        book_paths_without_opf, books_to_update, dirs_to_rename,
-        file_ids_to_change, ids_to_delete_from_db, new_book_paths, path_to_ids)
-    db.conn.close()
-    if is_git:
-      add_files_to_git(dbdir, unknown_book_files)
-    send_message()  # Notify the Calibre GUI of the change.
+    if do_half_dry_run:
+      print >>sys.stderr, 'info: Dry run, not applying changes.'
+    else:
+      print >>sys.stderr, 'info: Applying database and filesystem changes.'
+      apply_db_and_fs_changes(
+          dbdir, is_git, db, book_data_deletes, book_data_inserts,
+          book_data_updates, book_paths_without_opf, books_to_update,
+          dirs_to_rename, file_ids_to_change, ids_to_delete_from_db,
+          new_book_paths, path_to_ids)
+      db.conn.close()
+      if is_git:
+        add_files_to_git(dbdir, unknown_book_files)
+      send_message()  # Notify the Calibre GUI of the change.
   else:
     print >>sys.stderr, 'info: Calibre database is up-to-date, nothing to do.'
     db.conn.close()
     if is_git:
       add_files_to_git(dbdir, unknown_book_files)
   # TODO(pts): Occasionally we get MM (not added to the index) changes on
-  #   metadata.db -- why?
-  print >>sys.stderr, 'info: Done.'
+  #   metadata.db -- why? Probably when a book is removed in Calibre.
   if is_git:
-    print >>sys.stderr, 'info: Do not forget to run: git commit -m update'
-
+    print >>sys.stderr, (
+        'info: Done, do not forget to run: git commit -a -m update')
+  else:
+    print >>sys.stderr, 'info: Done.'
+  
 
 if __name__ == '__main__':
   try:
