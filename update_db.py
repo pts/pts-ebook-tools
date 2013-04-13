@@ -36,7 +36,9 @@ TODO(pts): Add documentation when to exit from Calibre. Is an exit needed?
 TODO(pts): Disallow processing books with an older version of Calibre.
 TODO(pts): Add rebuild_db.py to another repository, indicate that it's
   incorrect.
-TODO(pts): What if metadata.opf contains a nonexisting cover.jpg?
+TODO(pts): What if metadata.opf contains a nonexisting cover.jpg? (It happens
+  if Calibre removes the cover, but it doesn't update metadata.opf.) We should
+  detect this and change metadata.opf to <guide/>.
 """
 
 # by pts@fazekas.hu at Wed Dec 26 12:54:02 CET 2012
@@ -627,8 +629,9 @@ def figure_out_what_to_change(db, dbdir, is_git):
     if os.path.isdir(book_dir):
       opf_name = os.path.join(book_dir, 'metadata.opf')
       if os.path.exists(opf_name):
-        opf_data = open(opf_name).read().replace('\r\n', '\n').rstrip('\r\n')
-        odb_data = get_db_opf(db, book_id)
+        opf_data = sort_dc_subject(
+            open(opf_name).read().replace('\r\n', '\n').rstrip('\r\n'))
+        odb_data = sort_dc_subject(get_db_opf(db, book_id))
         if opf_data != odb_data:
           # TODO(pts): Also ignore some other minor changes.
           # TODO(pts): If the UUID is different (e.g.
@@ -636,11 +639,11 @@ def figure_out_what_to_change(db, dbdir, is_git):
           #            should we treat them as two different books?
           # We call sort_dc_subject so that a difference in the tag order won't
           # make the books different.
-          odb_data = sort_dc_subject(replace_first_match(
-              odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE))
+          odb_data = replace_first_match(
+              odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE)
           if opf_data != odb_data:
-            opf_data2 = sort_dc_subject(replace_first_match(
-                opf_data, odb_data, CALIBRE_IDENTIFIER_RE))
+            opf_data2 = replace_first_match(
+                opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
             if opf_data2 == odb_data:
               file_ids_to_change[book_id] = (book_path, opf_data2)
             else:
