@@ -36,9 +36,9 @@ TODO(pts): Add documentation when to exit from Calibre. Is an exit needed?
 TODO(pts): Disallow processing books with an older version of Calibre.
 TODO(pts): Add rebuild_db.py to another repository, indicate that it's
   incorrect.
-TODO(pts): What if metadata.opf contains a nonexisting cover.jpg? (It happens
-  if Calibre removes the cover, but it doesn't update metadata.opf.) We should
-  detect this and change metadata.opf to <guide/>.
+TODO(pts): What if metadata.opf contains a nonexisting cover.jpg? We already
+  have fix_cover_jpg(...), but we don't call it often, e.g. we don't call it
+  when both the db and the metadata.opf has the incorrect <guide> tag.
 """
 
 # by pts@fazekas.hu at Wed Dec 26 12:54:02 CET 2012
@@ -598,6 +598,41 @@ def sort_dc_subject(opf_data):
       opf_data[match.end():])
 
 
+OPF_GUIDE_COVER_JPG_RE = re.compile(r'(?s)<guide>\s*<reference href="cover[.]jpg"[^>]*>\s*</guide>')
+"""Matches the <guide> tag with only cover[.].jpg."""
+
+OPF_EMPTY_GUIDE_RE = re.compile(r'<guide(?:/>|>\s*</guide>)')
+"""Matches an empty <guide> tag. <guide/> is the most common."""
+
+OPF_COVER_JPG_GUIDE_STR = ('<guide>\n        <reference href="cover.jpg" '
+                           'type="cover" title="Cover"/>\n    </guide>')
+
+
+def fix_cover_jpg(opf_data, book_dir):
+  """Fixes the <guide> tag based on the existence of cover.jpg."""
+  has_cover_jpg = os.path.isfile(os.path.join(book_dir, 'cover.jpg'))
+  match = OPF_GUIDE_COVER_JPG_RE.search(opf_data)
+  if match:
+    if not has_cover_jpg:
+      return '%s<guide/>%s' % (opf_data[:match.start()], opf_data[match.end():])
+  else:  # TODO(pts): Test this.
+    if has_cover_jpg:
+      match = OPF_EMPTY_GUIDE_RE.search(opf_data)
+      # TODO(pts): What if our OPF_COVER_JPG_GUIDE_STR gets out-of-date?
+      if match:
+        return '%s%s%s' % (
+            opf_data[:match.start()], OPF_COVER_JPG_GUIDE_STR,
+            opf_data[match.end():])
+      else:
+        if not opf_data.endswith('\n</package>'):
+          raise AssertionError('opf data does not end with package: %r' %
+                                opf_data[:-16])
+        i = opf_data.rfind('\n') + 1
+        return '%s%s%s' % (
+            opf_data[:i], OPF_COVER_JPG_GUIDE_STR, opf_data[i:])
+  return opf_data
+
+
 def figure_out_what_to_change(db, dbdir, is_git):
   """Figures out what to change, but keeps the files and the database intact."""
 
@@ -642,12 +677,14 @@ def figure_out_what_to_change(db, dbdir, is_git):
           odb_data = replace_first_match(
               odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE)
           if opf_data != odb_data:
-            opf_data2 = replace_first_match(
-                opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
-            if opf_data2 == odb_data:
-              file_ids_to_change[book_id] = (book_path, opf_data2)
-            else:
-              books_to_update[book_path] = book_id
+            opf_data = fix_cover_jpg(opf_data, book_dir)
+            if opf_data != odb_data:
+              opf_data2 = replace_first_match(
+                  opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
+              if opf_data2 == odb_data:
+                file_ids_to_change[book_id] = (book_path, opf_data2)
+              else:
+                books_to_update[book_path] = book_id
       match = TRAILING_BOOK_NUMBER_RE.search(book_path)
       if match:
         book_path2 = '%s (%d)' % (book_path[:match.start()], book_id)
