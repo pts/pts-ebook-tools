@@ -677,10 +677,10 @@ def figure_out_what_to_change(db, dbdir, is_git):
           odb_data = replace_first_match(
               odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE)
           if opf_data != odb_data:
-            opf_data = fix_cover_jpg(opf_data, book_dir)
-            if opf_data != odb_data:
-              opf_data2 = replace_first_match(
-                  opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
+            opf_data2 = replace_first_match(
+                opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
+            if opf_data2 != odb_data:
+              opf_data2 = fix_cover_jpg(opf_data2, book_dir)
               if opf_data2 == odb_data:
                 file_ids_to_change[book_id] = (book_path, opf_data2)
               else:
