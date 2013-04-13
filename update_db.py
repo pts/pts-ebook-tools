@@ -1223,7 +1223,7 @@ def main(argv):
         'info: Done, do not forget to run: git commit -a -m update')
   else:
     print >>sys.stderr, 'info: Done.'
-  
+
 
 if __name__ == '__main__':
   try:
