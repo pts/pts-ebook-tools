@@ -19,6 +19,8 @@ This script runs `git add' on all files (metadata.db, metadata.opf,
 cover.jpg and book data files) in the Calibre library if it finds that the
 library is in a Git repository.
 
+TODO(pts): `git rm' on deleted books so `git commit -m' would work, not only
+  `git commit -a -m'.
 TODO(pts): Detect renames (Ubik and Valis), add `deleted'.
   `git commit -a -m' detects the rename.
 TODO(pts): `git rm' the deletion of cover.jpg (happened in Calibre).
