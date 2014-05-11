@@ -1,0 +1,35 @@
+Speed measurements on an HDD:
+
+$ time ~/prg/pts-ebook-tools/update_db.py
+info: Updating Calibre database: ./metadata.db
+info: Found Git repository, scanning working tree for file changes.
+info: Finding changed books in: ./metadata.db
+info: Found 2768 book rows, 0 book rows to delete, 0 book rows to update, 0 file IDs to change and 0 directories to rename.
+info: Finding new books.
+info: Found 0 new book directories, 0 old book directories with metadata.opf missing, 0 unknown book files and 5527 book files.
+info: Reading book filename rows.
+info: Found 5527 book filename rows; will update 1, insert 0, delete 0.
+info: Applying database and filesystem changes.
+info: Adding all files to Git.
+info: Found 10260 files (3265794274 bytes) to (re)add to Git.
+info: Notifying the Calibre GUI of the change.
+info: Done, do not forget to run: git commit -a -m update
+
+real    1m5.263s
+user    0m13.129s
+sys     0m1.380s
+pts@narancs:/mnt/mandel/media/text/ebook-biglib$ time git commit -m update
+[master 7235f86] update
+ 5 files changed, 31 insertions(+)
+ create mode 100644 Eric Schlosser/Command and Control_ Nuclear Weapons, the Damascus Accident, and the Illusion of Safety (5376)/Command and Control_ Nuclear Weapons, the Damascus Accident, and the Illusion of Safety - Eric Schlosser.epub
+ create mode 100644 Eric Schlosser/Command and Control_ Nuclear Weapons, the Damascus Accident, and the Illusion of Safety (5376)/Command and Control_ Nuclear Weapons, the Damascus Accident, and the Illusion of Safety - Eric Schlosser.mobi
+ create mode 100644 Eric Schlosser/Command and Control_ Nuclear Weapons, the Damascus Accident, and the Illusion of Safety (5376)/cover.jpg
+ create mode 100644 Eric Schlosser/Command and Control_ Nuclear Weapons, the Damascus Accident, and the Illusion of Safety (5376)/metadata.opf
+
+real    0m1.135s
+user    0m0.280s
+sys     0m0.104s
+
+
+Please note that `git commit -a -m' is slower, but it's correct if a book
+was previously deleted. See the corresponding TODO in update_db.py
