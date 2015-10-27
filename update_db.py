@@ -215,13 +215,6 @@ def _connection__real_commit(self):
   return super(type(self), self).commit()
 
 
-def get_db_opf(db, book_id):
-  mi = db.get_metadata(book_id, index_is_id=True)
-  if mi.has_cover and not mi.cover:
-    mi.cover = 'cover.jpg'
-  return opf2.metadata_to_opf(mi).replace('\r\n', '\n').rstrip('\r\n')
-
-
 def delete_book_from_db(db, book_id):
   # The trigger books_delete_trg will remove from tables authors,
   # books_authors_link etc.
@@ -350,13 +343,14 @@ Example:
 
 def replace_first_match(to_data, from_data, re_obj):
   """Returns the updated to_data."""
-  to_match = re_obj.search(to_data)
-  if to_match:
-    from_match = re_obj.search(from_data)
-    if from_match and from_match.group() != to_match.group():
-      to_data = ''.join((to_data[:to_match.start()],
-                         from_match.group(),
-                         to_data[to_match.end():]))
+  if to_data != from_data:
+    to_match = re_obj.search(to_data)
+    if to_match:
+      from_match = re_obj.search(from_data)
+      if from_match and from_match.group() != to_match.group():
+        to_data = ''.join((to_data[:to_match.start()],
+                           from_match.group(),
+                           to_data[to_match.end():]))
   return to_data
 
 
@@ -586,16 +580,33 @@ def open_db(dbdir):
 OPF_DC_SUBJECT_RE = re.compile(r'(?sm)^ *<dc:subject>.*</dc:subject>(?=\n)')
 """Matches the block of <dc:subject>... lines (multiline) in an .opf."""
 
+OPF_DC_IDENTIFIER_RE = re.compile(
+    r'(?sm)^ *<dc:identifier[\s>].*</dc:identifier>(?=\n)')
+"""Matches the block of <dc:identifier>... lines (multiline) in an .opf."""
 
-def sort_dc_subject(opf_data):
+
+def _normalize_opf(opf_data):
   """Sorts the <dc:subject>... lines on an .opf file content."""
-  match = OPF_DC_SUBJECT_RE.search(opf_data)
-  if not match:
-    return opf_data
-  return '%s%s%s' % (
-      opf_data[:match.start()],
-      '\n'.join(sorted(match.group().split('\n'))),  # Sorted <dc:subject>s.
-      opf_data[match.end():])
+  opf_data = opf_data.replace('\r\n', '\n').rstrip('\r\n')
+  for re_obj in (OPF_DC_SUBJECT_RE, OPF_DC_IDENTIFIER_RE):
+    match = re_obj.search(opf_data)
+    if match:
+      opf_data = ''.join((
+          opf_data[:match.start()],
+          '\n'.join(sorted(match.group().split('\n'))),  # Sorted tag lines.
+          opf_data[match.end():]))
+  return opf_data
+
+
+def get_db_opf(db, book_id):
+  mi = db.get_metadata(book_id, index_is_id=True)
+  if mi.has_cover and not mi.cover:
+    mi.cover = 'cover.jpg'
+  return _normalize_opf(opf2.metadata_to_opf(mi))
+
+
+def get_file_opf(opf_filename):
+  return _normalize_opf(open(opf_filename).read())
 
 
 OPF_GUIDE_COVER_JPG_RE = re.compile(r'(?s)<guide>\s*<reference href="cover[.]jpg"[^>]*>\s*</guide>')
@@ -664,15 +675,14 @@ def figure_out_what_to_change(db, dbdir, is_git):
     if os.path.isdir(book_dir):
       opf_name = os.path.join(book_dir, 'metadata.opf')
       if os.path.exists(opf_name):
-        opf_data = sort_dc_subject(
-            open(opf_name).read().replace('\r\n', '\n').rstrip('\r\n'))
-        odb_data = sort_dc_subject(get_db_opf(db, book_id))
+        opf_data = get_file_opf(opf_name)
+        odb_data = get_db_opf(db, book_id)
         if opf_data != odb_data:
           # TODO(pts): Also ignore some other minor changes.
           # TODO(pts): If the UUID is different (e.g.
           #            <dc:identifier opf:scheme="uuid" id="uuid_id">),
           #            should we treat them as two different books?
-          # We call sort_dc_subject so that a difference in the tag order won't
+          # We call _normalize_opf so that a difference in the tag order won't
           # make the books different.
           odb_data = replace_first_match(
               odb_data, opf_data, CALIBRE_CONTRIBUTOR_RE)
@@ -913,14 +923,13 @@ def apply_db_and_fs_changes(
       for book_path in sorted(books_to_update):
         book_id = books_to_update[book_path]
         book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
-        opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
+        opf_data = get_file_opf(os.path.join(book_dir, 'metadata.opf'))
         # Parsing .opf files is the slowest per-book step.
         mi = opf2.OPF(cStringIO.StringIO(opf_data)).to_book_metadata()
         # TODO(pts): Make this and all other database updates faster by using
         # an in-memmory database here, and dumping it to the real database at the
         # end (db.conn.real_commit).
         db.set_metadata(book_id, mi, force_changes=True)
-        opf_data = opf_data.replace('\r\n', '\n').rstrip('\r\n')
         odb_data = get_db_opf(db, book_id)
         opf_data = replace_first_match(
             opf_data, odb_data, CALIBRE_CONTRIBUTOR_RE)
@@ -1001,7 +1010,7 @@ def apply_db_and_fs_changes(
   del max_book_id
   for book_path in sorted(new_book_paths):
     book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
-    opf_data = open(os.path.join(book_dir, 'metadata.opf')).read()
+    opf_data = get_file_opf(os.path.join(book_dir, 'metadata.opf'))
     force_book_id = new_book_path_to_id[book_path]
     book_id = add_book(db, opf_data, is_git, force_book_id, book_path, dbdir)
     old_path_to_ids[book_path] = ids = [book_id]
@@ -1017,7 +1026,6 @@ def apply_db_and_fs_changes(
       book_dir = os.path.join(dbdir, book_path.replace('/', os.sep))
     path_to_ids[force_book_path] = ids
     odb_data = get_db_opf(db, book_id)
-    opf_data = opf_data.replace('\r\n', '\n').rstrip('\r\n')
     opf_data2 = replace_first_match(  # get_db_opf returns correct book_id.
         opf_data, odb_data, CALIBRE_IDENTIFIER_RE)
     opf_data3 = replace_first_match(
